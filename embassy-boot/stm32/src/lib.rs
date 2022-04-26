@@ -65,6 +65,7 @@ impl<const PAGE_SIZE: usize> BootLoader<PAGE_SIZE> {
 
     pub unsafe fn load(&mut self, start: usize) -> ! {
         trace!("Loading app at 0x{:x}", start);
+        #[allow(unused_mut)]
         let mut p = cortex_m::Peripherals::steal();
         #[cfg(not(feature = "thumbv6"))]
         p.SCB.invalidate_icache();
