@@ -27,15 +27,17 @@ use hal::peripherals::FLEXIO0;
 use embassy_mcxa::clocks::config::Div8;
 use {defmt_rtt as _, embassy_mcxa as hal, panic_probe as _};
 
-/// 8N1 UART transmitter built on a single FlexIO Shifter + Timer pair.
-pub struct FlexioUartTx<'d, const TX_LANE: usize> {
+/// 8N1 UART transmitter. 
+/// Lane generic removed from struct!
+pub struct FlexioUartTx<'d> {
     shifter: Shifter<'d, 0>,
     #[allow(dead_code)]
     timer: FlexTimer<'d, 0>,
 }
 
-impl<'d, const TX_LANE: usize> FlexioUartTx<'d, TX_LANE> {
-    pub fn new<P: FlexioPin<FLEXIO0, TX_LANE>>(
+impl<'d> FlexioUartTx<'d> {
+    /// The generic 'L' is now local to this function.
+    pub fn new<P: FlexioPin<FLEXIO0, L>, const L: usize>(
         mut shifter: Shifter<'d, 0>,
         mut timer: FlexTimer<'d, 0>,
         tx_pin: Peri<'d, P>,
@@ -44,21 +46,22 @@ impl<'d, const TX_LANE: usize> FlexioUartTx<'d, TX_LANE> {
     ) -> Self {
         tx_pin.as_flexio_lane();
 
+        // Extract the lane number from the generic L
+        let lane = L as u8;
+
         let baud_div = (flexio_clk / (4 * baud)) as u16;
-        
         let compare: u16 = (0x15u16 << 8) | (baud_div.saturating_sub(1) & 0xFF);
 
         timer.set_config(&TimerConfig {
             timod: Timod::DUAL8BIT_BAUD,
-            // 0x0: Decrement on FlexIO clock
-            timdec: Timdec::FLEXIO_CLK_SHIFTCLK_TMR_OUT, 
+            timdec: Timdec::FLEXIO_CLK_SHIFTCLK_TMR_OUT,
             timena: Timena::TMR_TRIGHI_EN,
             timdis: Timdis::TMR_CMP,
             timrst: Timrst::NEVER,
             timout: Timout::ONE,
             tstop: Tstop::ENABLE_TMRDISABLE,
             tstart: true,
-            pin_select: TX_LANE as u8,
+            pin_select: lane, // Use the extracted lane
             pin_cfg: TimctlPincfg::OUTDISABLE,
             pin_pol: TimctlPinpol::ACTIVE_HIGH,
             trigger: TimerTrigger::InternalShifterFlag {
@@ -70,14 +73,14 @@ impl<'d, const TX_LANE: usize> FlexioUartTx<'d, TX_LANE> {
 
         shifter.set_config(&ShifterConfig {
             smod: Smod::TRANSMIT,
-            pin_select: TX_LANE as u8,
+            pin_select: lane, // Use the extracted lane
             pin_cfg: ShiftctlPincfg::OUTPUT,
             pin_pol: ShiftctlPinpol::ACTIVE_HIGH,
-            timer_pol: Timpol::NEGEDGE, // Stable data on falling edge
+            timer_pol: Timpol::NEGEDGE,
             timer_select: 0,
-            start_bit: Sstart::VALUE10, // Start = 0
-            stop_bit: Sstop::VALUE11,  // Stop = 1
-            input_source: Insrc::PIN,   // 0x0
+            start_bit: Sstart::VALUE10,
+            stop_bit: Sstop::VALUE11,
+            input_source: Insrc::PIN,
         });
 
         Self { shifter, timer }
@@ -89,7 +92,6 @@ impl<'d, const TX_LANE: usize> FlexioUartTx<'d, TX_LANE> {
         self.shifter.write_buffer(word);
     }
 
-    /// Blocking write of a byte slice.
     pub fn write(&mut self, data: &[u8]) {
         for &b in data {
             self.write_byte(b);
@@ -118,7 +120,7 @@ async fn main(_spawner: Spawner) {
     let shifter0 = shifters.take::<0>().unwrap();
     let timer0 = timers.take::<0>().unwrap();
 
-    let mut uart = FlexioUartTx::<28>::new(shifter0, timer0, p.P3_28, 115_200, flexio_clk_hz);
+    let mut uart = FlexioUartTx::new(shifter0, timer0, p.P3_28, 115_200, flexio_clk_hz);
 
     loop {
         uart.write(b"hello world");
