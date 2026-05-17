@@ -16,7 +16,7 @@ use embassy_executor::Spawner;
 use embassy_time::Timer;
 use hal::clocks::PoweredClock;
 use hal::clocks::periph_helpers::{Div4, FlexioClockSel, FlexioConfig};
-use hal::dma::{Channel, DmaChannel, DmaRequest, TransferOptions};
+use hal::dma::{Channel, DmaChannel, DmaRequest, InvalidParameters, TransferErrors, TransferOptions};
 use hal::flexio::{
     Flexio, FlexioPin, Insrc, ShiftctlPincfg, ShiftctlPinpol, Shifter, ShifterConfig, Smod,
     Sstart, Sstop, TimctlPincfg, TimctlPinpol, Timdec, Timdis, Timena, Timod, TimerConfig,
@@ -27,7 +27,26 @@ use hal::peripherals::FLEXIO0;
 use embassy_mcxa::clocks::config::Div8;
 use {defmt_rtt as _, embassy_mcxa as hal, panic_probe as _};
 
-// ─── FlexIO UART DMA personality ─────────────────────────────────────────────
+
+#[derive(Debug, defmt::Format)]
+pub enum Error {
+    /// Buffer was empty or exceeded the DMA transfer size limit.
+    InvalidParameters,
+    /// DMA controller reported a transfer error.
+    Transfer,
+}
+
+impl From<InvalidParameters> for Error {
+    fn from(_: InvalidParameters) -> Self {
+        Error::InvalidParameters
+    }
+}
+
+impl From<TransferErrors> for Error {
+    fn from(_: TransferErrors) -> Self {
+        Error::Transfer
+    }
+}
 
 const CHUNK_WORDS: usize = 64;
 
@@ -91,7 +110,7 @@ impl<'d> FlexioUartTx<'d> {
         }
     }
 
-    pub async fn write(&mut self, data: &[u8]) {
+    pub async fn write(&mut self, data: &[u8]) -> Result<(), Error> {
         let mut offset = 0;
         while offset < data.len() {
             let end = (offset + CHUNK_WORDS).min(data.len());
@@ -102,9 +121,10 @@ impl<'d> FlexioUartTx<'d> {
                 buf[i] = (byte as u32) | 0xFFFF_FF00;
             }
 
-            self.write_words_dma(&buf[..chunk.len()]).await;
+            self.write_words_dma(&buf[..chunk.len()]).await?;
             offset = end;
         }
+        Ok(())
     }
 
     /// Spin until the last byte has fully shifted out and the line is idle.
@@ -114,27 +134,24 @@ impl<'d> FlexioUartTx<'d> {
         }
     }
 
-    async fn write_words_dma(&mut self, words: &[u32]) {
+    async fn write_words_dma(&mut self, words: &[u32]) -> Result<(), Error> {
         let peri_addr = self.shifter.dma_address();
         self.shifter.enable_dma();
 
         let transfer = unsafe {
-            self.dma
-                .write_to_peripheral(
-                    words,
-                    peri_addr,
-                    Shifter::<0>::dma_request(),
-                    TransferOptions::COMPLETE_INTERRUPT,
-                )
-                .expect("FlexIO DMA setup")
+            self.dma.write_to_peripheral(
+                words,
+                peri_addr,
+                Shifter::<0>::dma_request(),
+                TransferOptions::COMPLETE_INTERRUPT,
+            )?
         };
 
-        transfer.await.ok();
+        let result = transfer.await.map_err(Error::from);
         self.shifter.disable_dma();
+        result
     }
 }
-
-// ─── Entry point ─────────────────────────────────────────────────────────────
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -165,10 +182,10 @@ async fn main(_spawner: Spawner) {
 
     let mut counter: u32 = 0;
     loop {
-        uart.write(b"Hello from FlexIO UART DMA! count=").await;
+        uart.write(b"Hello from FlexIO UART DMA! count=").await.unwrap();
         let mut buf = [0u8; 10];
-        uart.write(fmt_u32(counter, &mut buf)).await;
-        uart.write(b"\r\n").await;
+        uart.write(fmt_u32(counter, &mut buf)).await.unwrap();
+        uart.write(b"\r\n").await.unwrap();
         uart.blocking_flush();
 
         defmt::info!("Sent line {}", counter);
