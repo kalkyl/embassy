@@ -114,7 +114,7 @@ use core::task::{Context, Poll};
 use embassy_hal_internal::{Peri, PeripheralType};
 use maitake_sync::WaitCell;
 
-pub(crate) use crate::_generated::DmaRequest;
+pub use crate::_generated::DmaRequest;
 use crate::clocks::enable_and_reset;
 use crate::clocks::periph_helpers::NoConfig;
 use crate::dma::sealed::SealedChannel;
@@ -837,10 +837,14 @@ impl DmaChannel<'_> {
         &mut self,
         buf: &[W],
         peri_addr: *mut W,
+        request: DmaRequest,
         options: TransferOptions,
     ) -> Result<Transfer<'_>, InvalidParameters> {
-        unsafe { self.setup_write_to_peripheral(buf, peri_addr, false, options)? };
-        Ok(Transfer::new(self.reborrow()))
+        unsafe {
+            self.setup_write_to_peripheral(buf, peri_addr, false, options)?;
+            self.set_request_source(request);
+            Ok(self.start_transfer())
+        }
     }
 
     /// Read data from a peripheral register to memory.
@@ -862,10 +866,14 @@ impl DmaChannel<'_> {
         &mut self,
         peri_addr: *const W,
         buf: &mut [W],
+        request: DmaRequest,
         options: TransferOptions,
     ) -> Result<Transfer<'_>, InvalidParameters> {
-        unsafe { self.setup_read_from_peripheral(peri_addr, buf, false, options)? };
-        Ok(Transfer::new(self.reborrow()))
+        unsafe {
+            self.setup_read_from_peripheral(peri_addr, buf, false, options)?;
+            self.set_request_source(request);
+            Ok(self.start_transfer())
+        }
     }
 
     /// Configure a memory-to-peripheral DMA transfer without starting it.
