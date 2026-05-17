@@ -42,6 +42,8 @@ pub mod ctimer;
 pub mod dma;
 #[cfg(feature = "executor-platform")]
 pub mod executor;
+#[cfg(mcxa_flexio)]
+pub mod flexio;
 #[cfg(mcxa_flexspi)]
 pub mod flexspi;
 #[cfg(mcxa_gpio)]

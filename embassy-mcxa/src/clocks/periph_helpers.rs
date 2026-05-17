@@ -12,8 +12,8 @@ use crate::clocks::VddLevel;
 #[cfg(feature = "mcxa5xx")]
 use crate::pac::mrcc::FlexspiClkselMux;
 use crate::pac::mrcc::{
-    AdcClkselMux, ClkdivHalt, ClkdivReset, ClkdivUnstab, CtimerClkselMux, FclkClkselMux, Lpi2cClkselMux,
-    LpspiClkselMux, LpuartClkselMux, OstimerClkselMux,
+    AdcClkselMux, ClkdivHalt, ClkdivReset, ClkdivUnstab, CtimerClkselMux, FclkClkselMux, FlexioClkselMux,
+    Lpi2cClkselMux, LpspiClkselMux, LpuartClkselMux, OstimerClkselMux,
 };
 
 #[must_use]
@@ -1288,6 +1288,101 @@ impl SPConfHelper for CTimerConfig {
                 reason: "exceeds max rating",
             });
         }
+
+        apply_div4!(self, clksel, clkdiv, variant, freq)
+    }
+}
+
+//
+// FlexIO
+//
+
+/// Selectable clocks for the FlexIO peripheral
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum FlexioClockSel {
+    /// FRO_LF_DIV — 12 MHz FRO divided down
+    FroLfDiv,
+    /// FRO_HF_GATED — high-frequency FRO (gated)
+    FroHfGated,
+    /// External CLK_IN (SOSC)
+    #[cfg(not(feature = "sosc-as-gpio"))]
+    ClkIn,
+    /// 1 MHz fixed clock
+    Clk1M,
+    /// PLL1 output through its divisor
+    Pll1ClkDiv,
+    /// Disabled / no clock
+    None,
+}
+
+/// Top-level configuration for the FlexIO peripheral.
+pub struct FlexioConfig {
+    /// Power state required for this peripheral
+    pub power: PoweredClock,
+    /// Selected clock source
+    pub source: FlexioClockSel,
+    /// Pre-divisor applied to the selected source clock
+    pub div: Div4,
+}
+
+impl SPConfHelper for FlexioConfig {
+    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
+        let mrcc0 = crate::pac::MRCC0;
+        let clksel = mrcc0.mrcc_flexio0_clksel();
+        let clkdiv = mrcc0.mrcc_flexio0_clkdiv();
+
+        let (freq, variant) = match self.source {
+            FlexioClockSel::FroLfDiv => {
+                let freq = clocks.ensure_fro_lf_div_active(&self.power)?;
+                #[cfg(feature = "mcxa2xx")]
+                let mux = FlexioClkselMux::ClkrootFunc0;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = FlexioClkselMux::I0ClkrootFunc0;
+                (freq, mux)
+            }
+            FlexioClockSel::FroHfGated => {
+                let freq = clocks.ensure_fro_hf_active(&self.power)?;
+                #[cfg(feature = "mcxa2xx")]
+                let mux = FlexioClkselMux::ClkrootFunc1;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = FlexioClkselMux::I1ClkrootFunc1;
+                (freq, mux)
+            }
+            #[cfg(not(feature = "sosc-as-gpio"))]
+            FlexioClockSel::ClkIn => {
+                let freq = clocks.ensure_clk_in_active(&self.power)?;
+                #[cfg(feature = "mcxa2xx")]
+                let mux = FlexioClkselMux::ClkrootFunc3;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = FlexioClkselMux::I3ClkrootFunc3;
+                (freq, mux)
+            }
+            FlexioClockSel::Clk1M => {
+                let freq = clocks.ensure_clk_1m_active(&self.power)?;
+                #[cfg(feature = "mcxa2xx")]
+                let mux = FlexioClkselMux::ClkrootFunc5;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = FlexioClkselMux::I5ClkrootFunc5;
+                (freq, mux)
+            }
+            FlexioClockSel::Pll1ClkDiv => {
+                let freq = clocks.ensure_pll1_clk_div_active(&self.power)?;
+                #[cfg(feature = "mcxa2xx")]
+                let mux = FlexioClkselMux::ClkrootFunc6;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = FlexioClkselMux::I6ClkrootFunc6;
+                (freq, mux)
+            }
+            FlexioClockSel::None => {
+                clksel.write(|w| w.set_mux(FlexioClkselMux::_RESERVED_7));
+                clkdiv.modify(|w| {
+                    w.set_reset(ClkdivReset::On);
+                    w.set_halt(ClkdivHalt::On);
+                });
+                return Ok(PreEnableParts::empty());
+            }
+        };
 
         apply_div4!(self, clksel, clkdiv, variant, freq)
     }

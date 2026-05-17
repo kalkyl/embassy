@@ -32,6 +32,10 @@ fn main() {
         cfgs.declare(&driver_to_cfg_name(peripheral));
     }
 
+    // FlexIO is not yet in META_PERIPHERALS; declare its cfgs manually.
+    cfgs.declare("mcxa_flexio");
+    cfgs.declare("mcxa_flexio0");
+
     // Enable all drivers for this chip
     for peripheral in METADATA.peripherals {
         if peripheral.driver_name.is_empty() {
@@ -41,12 +45,18 @@ fn main() {
         cfgs.enable(&driver_to_cfg_name(peripheral.driver_name));
     }
 
+    // Enable mcxa_flexio if any FLEXIO peripheral is present (regardless of driver_name).
+    if METADATA.peripherals.iter().any(|p| p.name.starts_with("FLEXIO")) {
+        cfgs.enable("mcxa_flexio");
+    }
+
     let generated = [
         generate_peripherals_call(),
         generate_interrupt_mod_call(),
         generate_cc_gates(),
         generate_dma_requests_enum(),
         generate_instance_calls(),
+        generate_flexio_instance_calls(),
         generate_gpio_pin_impls(),
         generate_adc_pin_impls(),
         generate_clkout_impls(),
@@ -56,6 +66,7 @@ fn main() {
         generate_ctimer_pin_impls(),
         generate_lpuart_pin_impls(),
         generate_flexspi_pin_impls(),
+        generate_flexio_pin_impls(),
     ];
 
     let out_dir = &PathBuf::from(env::var_os("OUT_DIR").unwrap());
@@ -555,6 +566,54 @@ fn rustfmt(path: impl AsRef<Path>) {
             }
         }
     }
+}
+
+fn generate_flexio_instance_calls() -> TokenStream {
+    let mut generated = TokenStream::new();
+
+    let flexio_regex = Regex::new(r"^FLEXIO(\d+)$").unwrap();
+    for peripheral in METADATA.peripherals {
+        let Some(n) = get_regex_num(peripheral.name, &flexio_regex) else {
+            continue;
+        };
+        let n = proc_macro2::Literal::u32_unsuffixed(n);
+        generated.extend(quote! {
+            crate::impl_flexio_instance!(#n);
+        });
+    }
+
+    generated
+}
+
+fn generate_flexio_pin_impls() -> TokenStream {
+    let mut generated = TokenStream::new();
+
+    let flexio_regex = Regex::new(r"^FLEXIO(\d+)$").unwrap();
+    let lane_regex = Regex::new(r"^D(\d+)$").unwrap();
+
+    for peripheral in METADATA.peripherals {
+        if !flexio_regex.is_match(peripheral.name) {
+            continue;
+        }
+        let flexio_name = format_ident!("{}", peripheral.name);
+        for signal in peripheral.signals {
+            let Some(lane) = get_regex_num(signal.name, &lane_regex) else {
+                continue;
+            };
+            let lane = proc_macro2::Literal::u32_unsuffixed(lane);
+            for pin in signal.pins {
+                let pin_name = format_ident!("{}", pin.pin);
+                let mux = format_ident!("Mux{}", pin.alt);
+                let feature_gate = pin_feature_gate(pin.pin);
+                generated.extend(quote! {
+                    #feature_gate
+                    crate::impl_flexio_pin!(#pin_name, #flexio_name, #lane, #mux);
+                });
+            }
+        }
+    }
+
+    generated
 }
 
 fn get_regex_num(string: &str, regex: &Regex) -> Option<u32> {
