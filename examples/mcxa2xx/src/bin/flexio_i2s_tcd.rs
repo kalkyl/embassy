@@ -183,13 +183,14 @@ impl<'d> FlexioI2sTx<'d> {
 
     /// Start a continuous ping-pong DMA stream.
     ///
-    /// `buf_a` and `buf_b` must be `'static`; pass the pointers you obtained
-    /// from `ConstStaticCell::take()`.  Fill `buf_a` before calling this so
-    /// the very first half has valid audio.
+    /// Fill `buf_a` before calling so the first buffer period has valid audio.
     ///
     /// # Safety
     ///
-    /// Only write to a buffer after `next_half()` reports it finished.
+    /// `buf_a` and `buf_b` must point into `'static` storage that remains
+    /// valid for the life of the returned `PingPongTransfer`.  Only write to a
+    /// buffer after `next_half()` reports it finished — the hardware is reading
+    /// from it until then.
     pub unsafe fn start_ping_pong(
         &mut self,
         pool: &'static mut PingPongPool,
@@ -270,8 +271,8 @@ async fn main(_spawner: Spawner) {
     fill(buf_b);
 
     // Start the circular TCD chain.  DMA immediately begins streaming buf_a.
-    // SAFETY: buf_a and buf_b are 'static, properly aligned, and we respect
-    // the ownership protocol below (only write to the buffer that just finished).
+    // SAFETY: buf_a and buf_b are 'static, and we only write to whichever
+    // buffer next_half() reports as finished (the one DMA is no longer using).
     let mut stream = unsafe {
         i2s.start_ping_pong(tcds, buf_a.as_ptr(), buf_b.as_ptr(), BUF_LEN)
             .unwrap()

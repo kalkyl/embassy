@@ -867,10 +867,10 @@ impl DmaChannel<'_> {
     ///
     /// # Safety
     ///
-    /// * Both buffers must remain valid and correctly aligned for the entire
-    ///   lifetime of the returned [`PingPongTransfer`].
+    /// * `buf_a` and `buf_b` must point to valid, equally-sized buffers of
+    ///   `len` elements that remain valid for the life of the returned transfer.
     /// * Only write to a buffer after [`PingPongTransfer::next_half`] reports
-    ///   that it has finished — not while the hardware is streaming it.
+    ///   that it has finished — hardware is reading from it until then.
     /// * `peri_addr` must be a valid, writable peripheral data register.
     pub unsafe fn ping_pong_write_to_peripheral<W: Word>(
         &mut self,
