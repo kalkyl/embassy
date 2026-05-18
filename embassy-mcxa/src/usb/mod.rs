@@ -80,18 +80,23 @@ impl<T> SyncUnsafeCell<T> {
 }
 
 static BDT: SyncUnsafeCell<BdtBuffer> = SyncUnsafeCell::new(BdtBuffer([0; 512]));
-static EP_BUF_OUT: SyncUnsafeCell<[[u8; 64]; EP_COUNT]> = SyncUnsafeCell::new([[0; 64]; EP_COUNT]);
-static EP_BUF_IN: SyncUnsafeCell<[[u8; 64]; EP_COUNT]> = SyncUnsafeCell::new([[0; 64]; EP_COUNT]);
+static EP_BUF_OUT: SyncUnsafeCell<[[[u8; 64]; 2]; EP_COUNT]> = SyncUnsafeCell::new([[[0; 64]; 2]; EP_COUNT]);
+static EP_BUF_IN: SyncUnsafeCell<[[[u8; 64]; 2]; EP_COUNT]> = SyncUnsafeCell::new([[[0; 64]; 2]; EP_COUNT]);
 
 struct UsbFsState {
     bus_waker: AtomicWaker,
     ep_in_wakers: [AtomicWaker; EP_COUNT],
     ep_out_wakers: [AtomicWaker; EP_COUNT],
     ep_out_ready: [AtomicU16; EP_COUNT],
+    ep_out_token: [AtomicU8; EP_COUNT],
     pending_addr: AtomicU8,
     events: AtomicU8,
     ep_in_data1: AtomicU8,
     ep_out_data1: AtomicU8,
+    ep_in_odd: AtomicU8,
+    ep_out_odd: AtomicU8,
+    ep_in_active_odd: AtomicU8,
+    ep_out_done_odd: AtomicU8,
 }
 
 static STATE: UsbFsState = UsbFsState {
@@ -126,10 +131,24 @@ static STATE: UsbFsState = UsbFsState {
         AtomicU16::new(OUT_EMPTY),
         AtomicU16::new(OUT_EMPTY),
     ],
+    ep_out_token: [
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+    ],
     pending_addr: AtomicU8::new(0),
     events: AtomicU8::new(0),
     ep_in_data1: AtomicU8::new(0),
     ep_out_data1: AtomicU8::new(0),
+    ep_in_odd: AtomicU8::new(0),
+    ep_out_odd: AtomicU8::new(0),
+    ep_in_active_odd: AtomicU8::new(0),
+    ep_out_done_odd: AtomicU8::new(0),
 };
 
 /// USB full-speed device driver.
@@ -245,7 +264,7 @@ pub fn debug_dump_registers() {
     let usb = usb();
     let mrcc = crate::pac::MRCC0;
     defmt::info!(
-        "usb regs: istat={:#04x} stat={:#04x} ctl={:#04x} addr={:#04x} inten={:#04x} errstat={:#04x} endpt0={:#04x} endpt1={:#04x} control={:#04x} usbctrl={:#04x} usbtrc0={:#04x} observe={:#04x} otgstat={:#04x} otgctl={:#04x} perid={:#04x} rev={:#04x} | mrcc clksel={:#010x} clkdiv={:#010x} cc0={:#010x}",
+        "usb regs: istat={:#04x} stat={:#04x} ctl={:#04x} addr={:#04x} inten={:#04x} errstat={:#04x} endpt0={:#04x} endpt1={:#04x} control={:#04x} usbctrl={:#04x} usbtrc0={:#04x} observe={:#04x} otgstat={:#04x} otgctl={:#04x} perid={:#04x} rev={:#04x} | ep0out0={:#010x} ep0out1={:#010x} ep0in0={:#010x} ep0in1={:#010x} ready={} token={:#04x} out_odd={} done_odd={} in_odd={} in_active={} events={:#04x} | mrcc clksel={:#010x} clkdiv={:#010x} cc0={:#010x}",
         usb.istat().read().0,
         usb.stat().read().0,
         usb.ctl().read().0,
@@ -262,6 +281,17 @@ pub fn debug_dump_registers() {
         usb.otgctl().read().0,
         usb.perid().read().0,
         usb.rev().read().0,
+        bd_ctrl(bd_index(0, false, false)),
+        bd_ctrl(bd_index(0, false, true)),
+        bd_ctrl(bd_index(0, true, false)),
+        bd_ctrl(bd_index(0, true, true)),
+        STATE.ep_out_ready[0].load(Ordering::Acquire),
+        STATE.ep_out_token[0].load(Ordering::Acquire),
+        get_odd(&STATE.ep_out_odd, 0),
+        get_odd(&STATE.ep_out_done_odd, 0),
+        get_odd(&STATE.ep_in_odd, 0),
+        get_odd(&STATE.ep_in_active_odd, 0),
+        STATE.events.load(Ordering::Acquire),
         mrcc.mrcc_usb0_clksel().read().0,
         mrcc.mrcc_usb0_clkdiv().read().0,
         mrcc.mrcc_glb_cc0().read().0,
@@ -322,13 +352,14 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
         })
     }
 
-
-fn start(mut self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPipe) {
+    fn start(mut self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPipe) {
         self.ep_in_max_packet[0] = control_max_packet_size;
         self.ep_out_max_packet[0] = control_max_packet_size;
 
         configure_usb_clock();
-        unsafe { _ = enable_and_reset::<USB0>(&NoConfig); }
+        unsafe {
+            _ = enable_and_reset::<USB0>(&NoConfig);
+        }
         // enable_and_reset() calls disable_clock() which re-halts the CLKDIV; un-halt it now.
         unhalt_usb_clock();
 
@@ -347,7 +378,8 @@ fn start(mut self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPip
         usb.ctl().write(|w| w.set_usbensofen(pac::vals::Usbensofen::EN_USB_SOF));
 
         // 3. Enable Clock Recovery (CRITICAL for internal FIRC 48MHz)
-        usb.clk_recover_irc_en().write(|w| w.set_irc_en(pac::vals::IrcEn::EN_IRC));
+        usb.clk_recover_irc_en()
+            .write(|w| w.set_irc_en(pac::vals::IrcEn::EN_IRC));
         usb.clk_recover_ctrl().write(|w| {
             w.set_clock_recover_en(pac::vals::ClockRecoverEn::EN_CLK_RECOVER);
             // Stay in fine-tracking mode across bus resets (don't go back to slow rough phase).
@@ -363,7 +395,8 @@ fn start(mut self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPip
 
         // 4. Setup BDT Addresses
         let bdt_addr = BDT.get() as u32;
-        usb.bdtpage1().write_value(pac::regs::Bdtpage1(((bdt_addr >> 8) as u8) & 0xfe));
+        usb.bdtpage1()
+            .write_value(pac::regs::Bdtpage1(((bdt_addr >> 8) as u8) & 0xfe));
         usb.bdtpage2().write_value(pac::regs::Bdtpage2((bdt_addr >> 16) as u8));
         usb.bdtpage3().write_value(pac::regs::Bdtpage3((bdt_addr >> 24) as u8));
 
@@ -387,11 +420,13 @@ fn start(mut self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPip
 
         // 8. Attach: enable D+ pull-up. Only set DPPULLUPNONOTG — SESS_VLD is a
         // read-only hardware status bit and VBUS_SOURCE_SEL=1 can suppress detection.
-        usb.control().write(|w| w.set_dppullupnonotg(pac::vals::Dppullupnonotg::EN_DEVICE_DP_PU));
+        usb.control()
+            .write(|w| w.set_dppullupnonotg(pac::vals::Dppullupnonotg::EN_DEVICE_DP_PU));
 
         interrupt::typelevel::USB0::unpend();
-        unsafe { interrupt::typelevel::USB0::enable(); }
-
+        unsafe {
+            interrupt::typelevel::USB0::enable();
+        }
 
         (
             Bus {
@@ -423,6 +458,10 @@ impl embassy_usb_driver::Bus for Bus<'_> {
             }
 
             let events = STATE.events.swap(0, Ordering::Acquire);
+            #[cfg(feature = "defmt")]
+            if events != 0 {
+                defmt::info!("usb: bus poll events={:#04x}", events);
+            }
             if events & EVENT_RESET != 0 {
                 #[cfg(feature = "defmt")]
                 defmt::info!("usb: bus poll reset");
@@ -473,7 +512,9 @@ impl embassy_usb_driver::Bus for Bus<'_> {
                 }
                 bits |= ENDPT_EPTXEN | ENDPT_EPCTLDIS;
                 set_data1(&STATE.ep_in_data1, ep, false);
-                bd_release(bd_index(ep, true));
+                set_odd(&STATE.ep_in_odd, ep, false);
+                bd_release(bd_index(ep, true, false));
+                bd_release(bd_index(ep, true, true));
             } else {
                 if self.ep_out_max_packet[ep] == 0 {
                     return;
@@ -486,15 +527,18 @@ impl embassy_usb_driver::Bus for Bus<'_> {
                 }
                 bits |= ENDPT_EPRXEN | ENDPT_EPCTLDIS;
                 set_data1(&STATE.ep_out_data1, ep, false);
+                set_odd(&STATE.ep_out_odd, ep, false);
                 prime_out_ep(ep, self.ep_out_max_packet[ep]);
             }
         } else if ep_addr.is_in() {
             bits &= !ENDPT_EPTXEN;
-            bd_release(bd_index(ep, true));
+            bd_release(bd_index(ep, true, false));
+            bd_release(bd_index(ep, true, true));
             STATE.ep_in_wakers[ep].wake();
         } else {
             bits &= !ENDPT_EPRXEN;
-            bd_release(bd_index(ep, false));
+            bd_release(bd_index(ep, false, false));
+            bd_release(bd_index(ep, false, true));
             STATE.ep_out_wakers[ep].wake();
         }
         endpoint_write(ep, bits);
@@ -517,18 +561,21 @@ impl embassy_usb_driver::Bus for Bus<'_> {
             stalled
         );
 
-        let idx = bd_index(ep, ep_addr.is_in());
         if stalled {
-            bd_stall(idx);
+            bd_stall(bd_index(ep, ep_addr.is_in(), false));
+            bd_stall(bd_index(ep, ep_addr.is_in(), true));
             endpoint_write(ep, endpoint_read(ep) | ENDPT_EPSTALL);
         } else {
             endpoint_write(ep, endpoint_read(ep) & !ENDPT_EPSTALL);
-            bd_release(idx);
+            bd_release(bd_index(ep, ep_addr.is_in(), false));
+            bd_release(bd_index(ep, ep_addr.is_in(), true));
             if ep_addr.is_out() {
                 set_data1(&STATE.ep_out_data1, ep, false);
+                set_odd(&STATE.ep_out_odd, ep, false);
                 prime_out_ep(ep, self.ep_out_max_packet[ep]);
             } else {
                 set_data1(&STATE.ep_in_data1, ep, false);
+                set_odd(&STATE.ep_in_odd, ep, false);
             }
             if ep == 0 {
                 usb().ctl().modify(|w| w.set_txsuspendtokenbusy(false));
@@ -555,19 +602,29 @@ impl embassy_usb_driver::ControlPipe for ControlPipe<'_> {
             STATE.ep_out_wakers[0].register(cx.waker());
             let bc = STATE.ep_out_ready[0].load(Ordering::Acquire);
             if bc != OUT_EMPTY {
-                // Verify it's actually a SETUP token: the bd_token reads the PID that
-                // the hardware stamped into the BD ctrl field after completion. A STATUS
-                // ZLP (OUT DATA1, 0 bytes) arrives on EP0 after every control-IN response
-                // and also wakes this future — discard it and re-prime for the real SETUP.
-                let token = bd_token(bd_index(0, false));
+                #[cfg(feature = "defmt")]
+                defmt::info!(
+                    "usb: setup future woke bc={} token={:#04x} done_odd={} ctl={:#04x}",
+                    bc,
+                    STATE.ep_out_token[0].load(Ordering::Acquire),
+                    get_odd(&STATE.ep_out_done_odd, 0),
+                    usb().ctl().read().0
+                );
+                // A STATUS ZLP (OUT DATA1, 0 bytes) arrives on EP0 after every
+                // control-IN response and also wakes this future. Discard it and
+                // re-prime for the real SETUP.
+                let token = STATE.ep_out_token[0].load(Ordering::Acquire) as u32;
                 STATE.ep_out_ready[0].store(OUT_EMPTY, Ordering::Release);
                 if token != TOKEN_SETUP {
+                    #[cfg(feature = "defmt")]
+                    defmt::warn!("usb: setup future saw non-setup token={:#04x}", token);
                     prime_ep0_out_setup();
                     return Poll::Pending;
                 }
                 let mut setup = [0; 8];
+                let odd = get_odd(&STATE.ep_out_done_odd, 0) as usize;
                 critical_section::with(|_| unsafe {
-                    setup.copy_from_slice(&(&(*EP_BUF_OUT.get())[0])[..8]);
+                    setup.copy_from_slice(&(&(*EP_BUF_OUT.get())[0][odd])[..8]);
                 });
                 #[cfg(feature = "defmt")]
                 defmt::info!(
@@ -580,8 +637,6 @@ impl embassy_usb_driver::ControlPipe for ControlPipe<'_> {
                 );
                 set_data1(&STATE.ep_in_data1, 0, true);
                 set_data1(&STATE.ep_out_data1, 0, true);
-                prime_ep0_out_setup();
-                usb().ctl().modify(|w| w.set_txsuspendtokenbusy(false));
                 return Poll::Ready(setup);
             }
             Poll::Pending
@@ -600,11 +655,13 @@ impl embassy_usb_driver::ControlPipe for ControlPipe<'_> {
             }
         }
 
-        poll_fn(|cx| {
+        let len = poll_fn(|cx| {
             let ready = STATE.ep_out_ready[0].load(Ordering::Acquire);
             if ready != OUT_EMPTY {
-                let token = bd_token(bd_index(0, false));
+                let token = STATE.ep_out_token[0].load(Ordering::Acquire) as u32;
                 if token == TOKEN_SETUP {
+                    #[cfg(feature = "defmt")]
+                    defmt::warn!("usb: ep0 data_out aborted by setup token");
                     return Poll::Ready(Err(EndpointError::Disabled));
                 }
 
@@ -615,14 +672,13 @@ impl embassy_usb_driver::ControlPipe for ControlPipe<'_> {
                     return Poll::Ready(Err(EndpointError::BufferOverflow));
                 }
 
+                let odd = get_odd(&STATE.ep_out_done_odd, 0) as usize;
                 critical_section::with(|_| unsafe {
-                    buf[..len].copy_from_slice(&(&(*EP_BUF_OUT.get())[0])[..len]);
+                    buf[..len].copy_from_slice(&(&(*EP_BUF_OUT.get())[0][odd])[..len]);
                 });
                 STATE.ep_out_ready[0].store(OUT_EMPTY, Ordering::Release);
 
-                if last {
-                    let _ = start_ep0_in(&[]);
-                } else {
+                if !last {
                     prime_out_ep(0, self.max_packet_size);
                 }
                 return Poll::Ready(Ok(len));
@@ -631,7 +687,15 @@ impl embassy_usb_driver::ControlPipe for ControlPipe<'_> {
             STATE.ep_out_wakers[0].register(cx.waker());
             Poll::Pending
         })
-        .await
+        .await?;
+
+        if last {
+            start_ep0_in(&[])?;
+            prime_ep0_out_setup();
+            wait_in_done(0, || STATE.ep_out_ready[0].load(Ordering::Acquire) != OUT_EMPTY).await?;
+        }
+
+        Ok(len)
     }
 
     async fn data_in(&mut self, data: &[u8], first: bool, last: bool) -> Result<(), EndpointError> {
@@ -655,6 +719,7 @@ impl embassy_usb_driver::ControlPipe for ControlPipe<'_> {
         defmt::debug!("usb: ep0 accept zlp");
 
         let _ = start_ep0_in(&[]);
+        prime_ep0_out_setup();
         let _ = wait_in_done(0, || false).await;
     }
 
@@ -662,9 +727,12 @@ impl embassy_usb_driver::ControlPipe for ControlPipe<'_> {
         #[cfg(feature = "defmt")]
         defmt::warn!("usb: ep0 reject stall");
 
-        bd_stall(bd_index(0, false));
-        bd_stall(bd_index(0, true));
+        bd_stall(bd_index(0, false, false));
+        bd_stall(bd_index(0, false, true));
+        bd_stall(bd_index(0, true, false));
+        bd_stall(bd_index(0, true, true));
         endpoint_write(0, endpoint_read(0) | ENDPT_EPSTALL);
+        resume_ep0_token_processing();
     }
 
     async fn accept_set_address(&mut self, addr: u8) {
@@ -673,6 +741,7 @@ impl embassy_usb_driver::ControlPipe for ControlPipe<'_> {
 
         STATE.pending_addr.store(0x80 | (addr & 0x7f), Ordering::Release);
         let _ = start_ep0_in(&[]);
+        prime_ep0_out_setup();
         let _ = wait_in_done(0, || false).await;
     }
 }
@@ -708,8 +777,9 @@ impl embassy_usb_driver::EndpointOut for EndpointOut<'_> {
                     return Poll::Ready(Err(EndpointError::BufferOverflow));
                 }
 
+                let odd = get_odd(&STATE.ep_out_done_odd, ep) as usize;
                 critical_section::with(|_| unsafe {
-                    buf[..len].copy_from_slice(&(&(*EP_BUF_OUT.get())[ep])[..len]);
+                    buf[..len].copy_from_slice(&(&(*EP_BUF_OUT.get())[ep][odd])[..len]);
                 });
                 STATE.ep_out_ready[ep].store(OUT_EMPTY, Ordering::Release);
                 prime_out_ep(ep, self.info.max_packet_size);
@@ -821,7 +891,8 @@ fn configure_usb_clock() {
     while scg.spllcsr().read().spll_lock() != crate::pac::scg::SpllLock::EnabledAndValid {}
 
     // Select PLL1 (SPLL) as USB0 clock source and open hardware access gates.
-    mrcc.mrcc_usb0_clksel().write(|w| w.set_mux(crate::pac::mrcc::UsbClkselMux::ClkrootSpll));
+    mrcc.mrcc_usb0_clksel()
+        .write(|w| w.set_mux(crate::pac::mrcc::UsbClkselMux::ClkrootSpll));
     mrcc.mrcc_glb_acc0().modify(|w| w.0 |= 0x10000800);
     mrcc.mrcc_glb_cc0().modify(|w| w.0 |= 0x10000000);
 
@@ -839,16 +910,21 @@ fn unhalt_usb_clock() {
     let syscon = crate::pac::SYSCON;
     let mrcc = crate::pac::MRCC0;
 
-    syscon.clkunlock().write(|w| w.set_unlock(crate::pac::syscon::Unlock::Enable));
+    syscon
+        .clkunlock()
+        .write(|w| w.set_unlock(crate::pac::syscon::Unlock::Enable));
     // Step 1: halt and reset the divider (required before changing the divisor).
-    mrcc.mrcc_usb0_clkdiv().write_value(crate::pac::mrcc::Clkdiv(0x6000_0000));
+    mrcc.mrcc_usb0_clkdiv()
+        .write_value(crate::pac::mrcc::Clkdiv(0x6000_0000));
     // Step 2: clear HALT and RESET with DIV=0 (divide by 1, clock running).
     mrcc.mrcc_usb0_clkdiv().write(|w| {
         w.set_halt(crate::pac::mrcc::ClkdivHalt::On);
         w.set_reset(crate::pac::mrcc::ClkdivReset::On);
         w.set_div(0);
     });
-    syscon.clkunlock().write(|w| w.set_unlock(crate::pac::syscon::Unlock::Freeze));
+    syscon
+        .clkunlock()
+        .write(|w| w.set_unlock(crate::pac::syscon::Unlock::Freeze));
 }
 
 fn configure_usb_ram_access() {
@@ -865,8 +941,8 @@ fn endpoint_write(ep: usize, bits: u8) {
     usb().endpoint(ep).endpt().write_value(pac::regs::Endpt(bits));
 }
 
-fn bd_index(ep: usize, is_in: bool) -> usize {
-    ep * 4 + if is_in { 2 } else { 0 }
+fn bd_index(ep: usize, is_in: bool, odd: bool) -> usize {
+    ep * 4 + if is_in { 2 } else { 0 } + odd as usize
 }
 
 fn bdt_ptr() -> *mut BdEntry {
@@ -879,10 +955,6 @@ fn bd_ptr(index: usize) -> *mut BdEntry {
 
 fn bd_ctrl(index: usize) -> u32 {
     unsafe { read_volatile(core::ptr::addr_of!((*bd_ptr(index)).ctrl)) }
-}
-
-fn bd_token(index: usize) -> u32 {
-    (bd_ctrl(index) >> 2) & 0x0f
 }
 
 fn bd_release(index: usize) {
@@ -924,8 +996,13 @@ fn reset_state() {
     STATE.events.store(0, Ordering::Release);
     STATE.ep_in_data1.store(0, Ordering::Release);
     STATE.ep_out_data1.store(0, Ordering::Release);
+    STATE.ep_in_odd.store(0, Ordering::Release);
+    STATE.ep_out_odd.store(0, Ordering::Release);
+    STATE.ep_in_active_odd.store(0, Ordering::Release);
+    STATE.ep_out_done_odd.store(0, Ordering::Release);
     for ep in 0..EP_COUNT {
         STATE.ep_out_ready[ep].store(OUT_EMPTY, Ordering::Release);
+        STATE.ep_out_token[ep].store(0, Ordering::Release);
     }
 }
 
@@ -944,18 +1021,50 @@ fn take_data1(mask: &AtomicU8, ep: usize) -> bool {
     old & bit != 0
 }
 
+fn set_odd(mask: &AtomicU8, ep: usize, odd: bool) {
+    let bit = 1 << ep;
+    if odd {
+        mask.fetch_or(bit, Ordering::AcqRel);
+    } else {
+        mask.fetch_and(!bit, Ordering::AcqRel);
+    }
+}
+
+fn get_odd(mask: &AtomicU8, ep: usize) -> bool {
+    mask.load(Ordering::Acquire) & (1 << ep) != 0
+}
+
+fn take_next_odd(mask: &AtomicU8, ep: usize) -> bool {
+    let bit = 1 << ep;
+    let old = mask.fetch_xor(bit, Ordering::AcqRel);
+    old & bit != 0
+}
+
+fn resume_ep0_token_processing() {
+    usb().ctl().modify(|w| w.set_txsuspendtokenbusy(false));
+}
+
 fn prime_ep0_out_setup() {
+    STATE.ep_out_ready[0].store(OUT_EMPTY, Ordering::Release);
+    STATE.ep_out_token[0].store(0, Ordering::Release);
     set_data1(&STATE.ep_out_data1, 0, false);
-    let buf = unsafe { (*EP_BUF_OUT.get())[0].as_ptr() };
-    bd_prime(bd_index(0, false), buf, 8, false);
+    let odd = take_next_odd(&STATE.ep_out_odd, 0);
+    let buf = unsafe { (*EP_BUF_OUT.get())[0][odd as usize].as_ptr() };
+    bd_prime(bd_index(0, false, odd), buf, 8, false);
+    resume_ep0_token_processing();
 }
 
 fn prime_out_ep(ep: usize, max_packet_size: u16) {
     STATE.ep_out_ready[ep].store(OUT_EMPTY, Ordering::Release);
+    STATE.ep_out_token[ep].store(0, Ordering::Release);
     let max_packet_size = max_packet_size.min(64);
     let data1 = take_data1(&STATE.ep_out_data1, ep);
-    let buf = unsafe { (*EP_BUF_OUT.get())[ep].as_ptr() };
-    bd_prime(bd_index(ep, false), buf, max_packet_size, data1);
+    let odd = take_next_odd(&STATE.ep_out_odd, ep);
+    let buf = unsafe { (*EP_BUF_OUT.get())[ep][odd as usize].as_ptr() };
+    bd_prime(bd_index(ep, false, odd), buf, max_packet_size, data1);
+    if ep == 0 {
+        resume_ep0_token_processing();
+    }
 }
 
 fn start_ep0_in(data: &[u8]) -> Result<(), EndpointError> {
@@ -967,13 +1076,19 @@ fn start_in(ep: usize, data: &[u8]) -> Result<(), EndpointError> {
         return Err(EndpointError::BufferOverflow);
     }
 
+    let data1 = take_data1(&STATE.ep_in_data1, ep);
+    let odd = take_next_odd(&STATE.ep_in_odd, ep);
+    set_odd(&STATE.ep_in_active_odd, ep, odd);
+
     critical_section::with(|_| unsafe {
-        (&mut (*EP_BUF_IN.get())[ep])[..data.len()].copy_from_slice(data);
+        (&mut (*EP_BUF_IN.get())[ep][odd as usize])[..data.len()].copy_from_slice(data);
     });
 
-    let data1 = take_data1(&STATE.ep_in_data1, ep);
-    let buf = unsafe { (*EP_BUF_IN.get())[ep].as_ptr() };
-    bd_prime(bd_index(ep, true), buf, data.len() as u16, data1);
+    let buf = unsafe { (*EP_BUF_IN.get())[ep][odd as usize].as_ptr() };
+    bd_prime(bd_index(ep, true, odd), buf, data.len() as u16, data1);
+    if ep == 0 {
+        resume_ep0_token_processing();
+    }
     Ok(())
 }
 
@@ -985,7 +1100,8 @@ async fn wait_in_done(ep: usize, abort: impl Fn() -> bool) -> Result<(), Endpoin
         if endpoint_read(ep) & ENDPT_EPTXEN == 0 {
             return Poll::Ready(Err(EndpointError::Disabled));
         }
-        if bd_ctrl(bd_index(ep, true)) & BD_OWN == 0 {
+        let odd = get_odd(&STATE.ep_in_active_odd, ep);
+        if bd_ctrl(bd_index(ep, true, odd)) & BD_OWN == 0 {
             return Poll::Ready(Ok(()));
         }
         STATE.ep_in_wakers[ep].register(cx.waker());
@@ -1005,19 +1121,14 @@ unsafe fn on_interrupt() {
         for ep in 1..EP_COUNT {
             endpoint_write(ep, 0);
         }
-        for i in 4..64 {
-            unsafe {
-                write_volatile(core::ptr::addr_of_mut!((*bd_ptr(i)).ctrl), 0);
-                write_volatile(core::ptr::addr_of_mut!((*bd_ptr(i)).addr), 0);
-            }
-        }
 
         usb.addr().write_value(pac::regs::Addr(0));
         reset_state();
-        prime_ep0_out_setup();
-        endpoint_write(0, ENDPT_EPHSHK | ENDPT_EPRXEN | ENDPT_EPTXEN);
+        clear_bdt();
         usb.ctl().modify(|w| w.set_oddrst(true));
         usb.ctl().modify(|w| w.set_oddrst(false));
+        prime_ep0_out_setup();
+        endpoint_write(0, ENDPT_EPHSHK | ENDPT_EPRXEN | ENDPT_EPTXEN);
 
         STATE.events.fetch_or(EVENT_RESET, Ordering::Release);
         STATE.bus_waker.wake();
@@ -1047,7 +1158,7 @@ unsafe fn on_interrupt() {
         let ep_num = stat.endp() as usize;
         let is_tx = stat.tx() == pac::vals::Tx::TX_TRANSACTION;
         let odd = stat.odd().to_bits() as usize;
-        let bd_idx = ep_num * 4 + if is_tx { 2 } else { 0 } + odd;
+        let bd_idx = bd_index(ep_num, is_tx, odd != 0);
         let ctrl = bd_ctrl(bd_idx);
         let bc = (ctrl >> 16) as u16;
         let token_pid = (ctrl >> 2) & 0x0f;
@@ -1058,23 +1169,27 @@ unsafe fn on_interrupt() {
                     #[cfg(feature = "defmt")]
                     defmt::info!("usb isr: setup token bc={} ctrl={:#010x}", bc, ctrl);
 
-                    bd_release(bd_index(0, true));
+                    bd_release(bd_index(0, true, false));
+                    bd_release(bd_index(0, true, true));
                     set_data1(&STATE.ep_in_data1, 0, true);
                     set_data1(&STATE.ep_out_data1, 0, true);
+                    STATE.ep_out_token[0].store(token_pid as u8, Ordering::Release);
+                    set_odd(&STATE.ep_out_done_odd, 0, odd != 0);
                     STATE.ep_out_ready[0].store(bc, Ordering::Release);
-                    usb.ctl().modify(|w| w.set_txsuspendtokenbusy(false));
                 } else if token_pid == TOKEN_OUT {
                     #[cfg(feature = "defmt")]
                     if ep_num == 0 {
                         defmt::debug!("usb isr: ep0 out bc={} ctrl={:#010x}", bc, ctrl);
                     }
 
-                    STATE.ep_out_ready[ep_num].store(bc, Ordering::Release);
+                    STATE.ep_out_token[ep_num].store(token_pid as u8, Ordering::Release);
+                    set_odd(&STATE.ep_out_done_odd, ep_num, odd != 0);
                     // STATUS ZLP (bc=0) on EP0: re-prime immediately so the next SETUP
                     // token from the host does not see OWN=0 (which would cause OWNERR).
                     if ep_num == 0 && bc == 0 {
-                        let buf = unsafe { (*EP_BUF_OUT.get())[0].as_ptr() };
-                        bd_prime(bd_index(0, false), buf, 8, false);
+                        prime_ep0_out_setup();
+                    } else {
+                        STATE.ep_out_ready[ep_num].store(bc, Ordering::Release);
                     }
                 }
                 STATE.ep_out_wakers[ep_num].wake();
@@ -1105,7 +1220,19 @@ unsafe fn on_interrupt() {
 
     if istat & ISTAT_ERROR != 0 {
         #[cfg(feature = "defmt")]
-        defmt::warn!("usb isr: error errstat={:#04x}", usb.errstat().read().0);
+        defmt::warn!(
+            "usb isr: error errstat={:#04x} stat={:#04x} ctl={:#04x} ep0out0={:#010x} ep0out1={:#010x} ep0in0={:#010x} ep0in1={:#010x} out_odd={} in_odd={} in_active={}",
+            usb.errstat().read().0,
+            usb.stat().read().0,
+            usb.ctl().read().0,
+            bd_ctrl(bd_index(0, false, false)),
+            bd_ctrl(bd_index(0, false, true)),
+            bd_ctrl(bd_index(0, true, false)),
+            bd_ctrl(bd_index(0, true, true)),
+            get_odd(&STATE.ep_out_odd, 0),
+            get_odd(&STATE.ep_in_odd, 0),
+            get_odd(&STATE.ep_in_active_odd, 0),
+        );
 
         usb.errstat().write_value(pac::regs::Errstat(0xff));
         usb.istat().write_value(pac::regs::Istat(ISTAT_ERROR));
