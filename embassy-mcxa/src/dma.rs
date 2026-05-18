@@ -955,6 +955,95 @@ impl<'d> DmaChannel<'d> {
         Ok(PingPongTransfer::new(self, buf_a, buf_b, len))
     }
 
+    /// Start a continuous ping-pong DMA stream using a **single** circular buffer
+    /// and the eDMA INTHALF interrupt — no scatter-gather required.
+    ///
+    /// The DMA streams from `buf` (length `total_len`) to `peri_addr`.
+    /// `INTHALF` fires when the source counter reaches the midpoint (first half
+    /// done); `INTMAJOR` fires at the end (second half done).  `SLAST` resets
+    /// the source address after every major loop so the transfer repeats
+    /// automatically.
+    ///
+    /// [`PingPongTransfer::next_half`] awaits each interrupt and returns `0`
+    /// (first half done) or `1` (second half done), giving the CPU one half-
+    /// period to refill via [`PingPongTransfer::fill_idle`].
+    ///
+    /// # Arguments
+    ///
+    /// * `buf`       – Pointer to a buffer of `total_len` `W`-words.
+    /// * `total_len` – Total element count; **must be even** and ≤ `DMA_MAX_TRANSFER_SIZE`.
+    /// * `peri_addr` – Peripheral FIFO / data register address.
+    /// * `request`   – DMA request source.
+    ///
+    /// # Safety
+    ///
+    /// * `buf` must point to a valid region of `total_len` `W`-words that
+    ///   remains valid for the life of the transfer.  Obtain via
+    ///   `(&'static mut [W]).as_mut_ptr()` — the `&'static mut` must be
+    ///   consumed (not kept alive) so that no live Rust alias overlaps with
+    ///   the DMA access window.
+    /// * Only write to a half inside [`PingPongTransfer::fill_idle`] after
+    ///   [`PingPongTransfer::next_half`] reports it finished.
+    /// * `peri_addr` must be a valid writable peripheral data register.
+    pub unsafe fn inthalf_write_to_peripheral<W: Word>(
+        self,
+        buf: *mut W,
+        total_len: usize,
+        peri_addr: *mut W,
+        request: DmaRequest,
+    ) -> Result<PingPongTransfer<'d, W>, InvalidParameters> {
+        if total_len < 2 || total_len > DMA_MAX_TRANSFER_SIZE || total_len % 2 != 0 {
+            return Err(InvalidParameters);
+        }
+
+        let half_len = total_len / 2;
+        let hw_size = W::size().to_hw_size();
+        let soff = W::size().bytes() as i16;
+        let nbytes = W::size().bytes() as u32;
+        let attr = ((hw_size as u16) << 8) | (hw_size as u16);
+        let slast = -((total_len as i32) * (W::size().bytes() as i32));
+
+        // CSR:
+        //   Bit 2  INTHALF  — interrupt when CITER reaches CEIL(BITER/2)
+        //   Bit 1  INTMAJOR — interrupt on major-loop completion
+        //   Bit 3  DREQ=0   — do NOT clear ERQ (keep running)
+        //   Bit 4  ESG=0    — no scatter-gather; SLAST handles the wrap-around
+        const CSR: u16 = 0x0006; // INTHALF | INTMAJOR
+
+        let tcd = Tcd {
+            saddr: buf as u32,
+            soff,
+            attr,
+            nbytes,
+            slast,
+            daddr: peri_addr as u32,
+            doff: 0,
+            citer: total_len as u16,
+            dlast_sga: 0,
+            csr: CSR,
+            biter: total_len as u16,
+        };
+
+        let t = self.tcd();
+        Self::reset_channel_state(&t);
+        fence(Ordering::Release);
+
+        unsafe { self.set_request_source(request) };
+        unsafe { self.load_tcd(&tcd) };
+
+        fence(Ordering::Release);
+
+        cortex_m::peripheral::NVIC::unpend(self.channel.interrupt());
+
+        t.ch_csr().modify(|w| {
+            w.set_erq(true);
+            w.set_earq(true);
+        });
+
+        // buf_a = first half, buf_b = second half.
+        Ok(PingPongTransfer::new(self, buf, unsafe { buf.add(half_len) }, half_len))
+    }
+
     /// Read data from a peripheral register to memory.
     ///
     /// The source address remains fixed (peripheral register) while
