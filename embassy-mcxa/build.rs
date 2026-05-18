@@ -181,6 +181,17 @@ fn generate_cc_gates() -> TokenStream {
         }
     }
 
+    if !METADATA
+        .peripherals
+        .iter()
+        .any(|p| p.name == "USB0" && p.gate.is_some())
+    {
+        generated.extend(quote! {
+            #[cfg(feature = "mcxa2xx")]
+            crate::impl_cc_gate!(USB0, mrcc_glb_cc0, mrcc_glb_rst0, usb0, NoConfig);
+        });
+    }
+
     generated
 }
 
