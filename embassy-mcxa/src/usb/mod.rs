@@ -166,7 +166,10 @@ impl<'d> Driver<'d> {
         max_packet_size: u16,
         interval_ms: u8,
     ) -> Result<EndpointInfo, EndpointAllocError> {
-        if ep_type == EndpointType::Isochronous || max_packet_size > 64 {
+        // FS isochronous allows up to 1023 bytes/frame per USB 2.0, but the static endpoint
+        // buffers in this driver are 64 bytes. Isochronous endpoints with MPS > 64 are therefore
+        // not supported. All other endpoint types are also capped at 64 by the FS spec.
+        if max_packet_size > 64 {
             return Err(EndpointAllocError);
         }
 
