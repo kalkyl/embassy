@@ -847,6 +847,111 @@ impl DmaChannel<'_> {
         }
     }
 
+    /// Start a continuous ping-pong DMA stream from two alternating source
+    /// buffers to a fixed peripheral address, using eDMA scatter-gather.
+    ///
+    /// The two TCDs form a circular chain (A → B → A → B → …).  Each TCD has
+    /// `INTMAJOR` set, so the DMA interrupt fires at the end of every buffer.
+    /// [`PingPongTransfer::next_half`] awaits each interrupt and returns `0`
+    /// for buffer A or `1` for buffer B, letting the caller refill the
+    /// just-completed half while hardware already streams the other.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool`      – 32-byte-aligned TCD storage; **must** be `'static`.
+    /// * `buf_a`     – Pointer to the first audio buffer.
+    /// * `buf_b`     – Pointer to the second audio buffer.
+    /// * `len`       – Number of `W` words in **each** buffer (must match).
+    /// * `peri_addr` – Peripheral FIFO / data register address.
+    /// * `request`   – DMA request source that drives the transfers.
+    ///
+    /// # Safety
+    ///
+    /// * Both buffers must remain valid and correctly aligned for the entire
+    ///   lifetime of the returned [`PingPongTransfer`].
+    /// * Only write to a buffer after [`PingPongTransfer::next_half`] reports
+    ///   that it has finished — not while the hardware is streaming it.
+    /// * `peri_addr` must be a valid, writable peripheral data register.
+    pub unsafe fn ping_pong_write_to_peripheral<W: Word>(
+        &mut self,
+        pool: &'static mut PingPongPool,
+        buf_a: *const W,
+        buf_b: *const W,
+        len: usize,
+        peri_addr: *mut W,
+        request: DmaRequest,
+    ) -> Result<PingPongTransfer<'_>, InvalidParameters> {
+        if len == 0 || len > DMA_MAX_TRANSFER_SIZE {
+            return Err(InvalidParameters);
+        }
+
+        let hw_size = W::size().to_hw_size();
+        let soff = W::size().bytes() as i16;
+        // One word per minor loop — the peripheral request signal drives each
+        // minor iteration, so nbytes == one word.
+        let nbytes = W::size().bytes() as u32;
+        let count = len as u16;
+        // Packed ATTR: SSIZE in bits 10:8, DSIZE in bits 2:0.
+        let attr = ((hw_size as u16) << 8) | (hw_size as u16);
+
+        // CSR for both in-memory TCDs:
+        //   Bit 1  INTMAJOR — interrupt on every major-loop completion
+        //   Bit 4  ESG      — scatter-gather: load next TCD on completion
+        //   Bit 3  DREQ=0   — do NOT clear ERQ after completion (keep running)
+        //   Bit 0  START=0  — peripheral ERQ drives the transfer, not SW start
+        const CSR: u16 = 0x0012; // ESG | INTMAJOR
+
+        pool.tcds[0] = Tcd {
+            saddr: buf_a as u32,
+            soff,
+            attr,
+            nbytes,
+            slast: 0, // scatter-gather overwrites SADDR from next TCD
+            daddr: peri_addr as u32,
+            doff: 0,
+            citer: count,
+            dlast_sga: &pool.tcds[1] as *const Tcd as i32,
+            csr: CSR,
+            biter: count,
+        };
+        pool.tcds[1] = Tcd {
+            saddr: buf_b as u32,
+            soff,
+            attr,
+            nbytes,
+            slast: 0,
+            daddr: peri_addr as u32,
+            doff: 0,
+            citer: count,
+            dlast_sga: &pool.tcds[0] as *const Tcd as i32,
+            csr: CSR,
+            biter: count,
+        };
+
+        let t = self.tcd();
+        Self::reset_channel_state(&t);
+        fence(Ordering::Release);
+
+        // Route peripheral request source.
+        unsafe { self.set_request_source(request) };
+
+        // Load TCD A into hardware registers.
+        unsafe { self.load_tcd(&pool.tcds[0]) };
+
+        fence(Ordering::Release);
+
+        // Unpend any stale IRQ that reset_channel_state may have left.
+        cortex_m::peripheral::NVIC::unpend(self.channel.interrupt());
+
+        // Enable hardware request — peripheral DMA flag now drives transfers.
+        t.ch_csr().modify(|w| {
+            w.set_erq(true);
+            w.set_earq(true);
+        });
+
+        Ok(PingPongTransfer::new(self.reborrow()))
+    }
+
     /// Read data from a peripheral register to memory.
     ///
     /// The source address remains fixed (peripheral register) while
@@ -1308,6 +1413,43 @@ struct Tcd {
     pub biter: u16,
 }
 
+/// Storage for the two 32-byte-aligned TCDs required by ping-pong DMA.
+///
+/// Declare one instance as a `static` so the descriptors remain valid for the
+/// entire streaming lifetime.  Use `static_cell::ConstStaticCell` for safe
+/// one-shot initialisation:
+///
+/// ```rust,ignore
+/// use static_cell::ConstStaticCell;
+/// use embassy_mcxa::dma::PingPongPool;
+///
+/// static TCDS: ConstStaticCell<PingPongPool> = ConstStaticCell::new(PingPongPool::new());
+/// ```
+#[repr(C, align(32))]
+pub struct PingPongPool {
+    tcds: [Tcd; 2],
+}
+
+impl PingPongPool {
+    /// Create a zeroed pool.  Suitable for `const` / `static` contexts.
+    pub const fn new() -> Self {
+        const ZERO: Tcd = Tcd {
+            saddr: 0,
+            soff: 0,
+            attr: 0,
+            nbytes: 0,
+            slast: 0,
+            daddr: 0,
+            doff: 0,
+            citer: 0,
+            dlast_sga: 0,
+            csr: 0,
+            biter: 0,
+        };
+        Self { tcds: [ZERO; 2] }
+    }
+}
+
 struct State {
     /// WaitCell for transfer complete interrupt
     waker: WaitCell,
@@ -1674,6 +1816,89 @@ impl<'a> Drop for Transfer<'a> {
         // it's cheap when the transfer is already complete.
         self.abort();
 
+        fence(Ordering::Release);
+    }
+}
+
+// ============================================================================
+// Ping-Pong Transfer (scatter-gather circular, peripheral TX)
+// ============================================================================
+
+/// An infinite ping-pong DMA stream to a peripheral, backed by two alternating
+/// buffers.
+///
+/// Obtained from [`DmaChannel::ping_pong_write_to_peripheral`].
+///
+/// Call [`next_half`](Self::next_half) in a loop; it resolves once per completed
+/// buffer and returns `0` when buffer A finished or `1` when buffer B finished.
+/// While the future is pending the hardware is already streaming the *other*
+/// buffer, so the caller has a full buffer period to refill the returned half
+/// before the next `next_half` call.
+///
+/// Dropping the transfer stops the DMA and releases the channel.
+pub struct PingPongTransfer<'d> {
+    channel: DmaChannel<'d>,
+    /// Alternates 0/1 per call to track which half just completed.
+    half: u8,
+}
+
+impl<'d> PingPongTransfer<'d> {
+    fn new(channel: DmaChannel<'d>) -> Self {
+        Self { channel, half: 0 }
+    }
+
+    /// Wait until the next buffer finishes transmitting.
+    ///
+    /// Returns `Ok(0)` when `buf_a` completed, `Ok(1)` when `buf_b` completed.
+    /// Calls alternate strictly: A, B, A, B, …
+    pub async fn next_half(&mut self) -> Result<u8, TransferErrors> {
+        use core::future::poll_fn;
+        poll_fn(|cx| {
+            let t = self.channel.tcd();
+            let es = t.ch_es().read();
+            if es.err() {
+                return Poll::Ready(Err(TransferErrors(es.0 as u8)));
+            }
+
+            // poll_wait registers the waker when pending, or consumes a stored
+            // wake (from a completed TCD's INTMAJOR) and returns Ready.
+            match STATES[self.channel.index()].waker.poll_wait(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(_) => {
+                    fence(Ordering::Acquire);
+                    let idx = self.half;
+                    self.half ^= 1;
+                    Poll::Ready(Ok(idx))
+                }
+            }
+        })
+        .await
+    }
+}
+
+impl<'d> Drop for PingPongTransfer<'d> {
+    fn drop(&mut self) {
+        let t = self.channel.tcd();
+        let irq = self.channel.channel.interrupt();
+        critical_section::with(|_| {
+            // Stop accepting new peripheral requests.
+            t.ch_csr().modify(|w| {
+                w.set_erq(false);
+                w.set_earq(false);
+            });
+            // Disable interrupts and scatter-gather so the channel is inert.
+            t.tcd_csr().modify(|w| {
+                w.set_intmajor(false);
+                w.set_inthalf(false);
+                w.set_esg(Esg::NormalFormat);
+            });
+            cortex_m::peripheral::NVIC::unpend(irq);
+        });
+        // Wait for any in-flight minor loop to drain.
+        while t.ch_csr().read().active() {
+            core::hint::spin_loop();
+        }
+        t.ch_int().write(|w| w.set_int(true));
         fence(Ordering::Release);
     }
 }
@@ -2215,12 +2440,14 @@ unsafe fn on_interrupt(ch_index: usize) {
         }
     }
 
-    // Clear INT flag
+    // In scatter-gather mode the hardware clears DONE during TCD reload, which
+    // can race with the ISR.  Read CH_INT.INT *before* clearing it: INT is set
+    // whenever INTMAJOR fires, including every ping-pong half completion, so
+    // it is a reliable "something finished" signal even when DONE is gone.
+    let int_set = t.ch_int().read().int();
     t.ch_int().write(|w| w.set_int(true));
 
-    // If DONE is set, this is a complete-transfer interrupt
-    // Only wake the full-transfer waker when the transfer is actually complete
-    if t.ch_csr().read().done() {
+    if int_set || t.ch_csr().read().done() {
         crate::perf_counters::incr_interrupt_edma0_wake();
         waker(ch_index).wake();
     }
