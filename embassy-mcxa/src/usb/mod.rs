@@ -410,6 +410,14 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
         usb.errstat().write_value(pac::regs::Errstat(0xff));
         usb.erren().write_value(pac::regs::Erren(0xff));
         usb.inten().write_value(pac::regs::Inten(0xbb));
+        // Disable clock-recovery interrupt: its status bit (USBTRC0[4]) fires the USB0
+        // IRQ but is NOT reflected in ISTAT, so it would cause infinite ISR re-entry if left enabled.
+        usb.clk_recover_int_en()
+            .write_value(pac::regs::ClkRecoverIntEn(0x00));
+        // Clear any stale CLK_RECOVER_INT_STATUS and USBTRC0 clock recovery interrupt flag.
+        usb.clk_recover_int_status()
+            .write_value(pac::regs::ClkRecoverIntStatus(0x10));
+        usb.usbtrc0().write_value(pac::regs::Usbtrc0(0x10));
 
         // 7. Ensure double-buffering starts on the "Even" bank
         usb.ctl().modify(|w| w.set_oddrst(true));
@@ -478,6 +486,8 @@ impl embassy_usb_driver::Bus for Bus<'_> {
                 return Poll::Ready(Event::Resume);
             }
 
+            #[cfg(feature = "defmt")]
+            defmt::trace!("usb: bus poll pending");
             STATE.bus_waker.register(cx.waker());
             Poll::Pending
         })
@@ -601,6 +611,8 @@ impl embassy_usb_driver::ControlPipe for ControlPipe<'_> {
         poll_fn(|cx| {
             STATE.ep_out_wakers[0].register(cx.waker());
             let bc = STATE.ep_out_ready[0].load(Ordering::Acquire);
+            #[cfg(feature = "defmt")]
+            defmt::trace!("usb: setup poll bc={} ctl={:#04x}", bc, usb().ctl().read().0);
             if bc != OUT_EMPTY {
                 #[cfg(feature = "defmt")]
                 defmt::info!(
@@ -1112,7 +1124,20 @@ async fn wait_in_done(ep: usize, abort: impl Fn() -> bool) -> Result<(), Endpoin
 
 unsafe fn on_interrupt() {
     let usb = usb();
+
+    // Clear clock-recovery interrupt flag (USBTRC0 bit 4). This flag fires the USB0 IRQ but is
+    // NOT in ISTAT, so without clearing it the ISR re-enters immediately on return and starves
+    // the executor. Writing 0x10 is safe: other bits are R/O, R/W-unchanged-by-0, or W1-to-trigger.
+    let usbtrc0 = usb.usbtrc0().read();
+    if usbtrc0.usb_clk_recovery_int() {
+        usb.usbtrc0().write_value(pac::regs::Usbtrc0(0x10));
+        usb.clk_recover_int_status()
+            .write_value(pac::regs::ClkRecoverIntStatus(0x10));
+    }
+
     let istat = usb.istat().read().0;
+    #[cfg(feature = "defmt")]
+    defmt::info!("usb isr: entry istat={:#04x}", istat);
 
     if istat & ISTAT_USBRST != 0 {
         #[cfg(feature = "defmt")]
@@ -1163,6 +1188,9 @@ unsafe fn on_interrupt() {
         let bc = (ctrl >> 16) as u16;
         let token_pid = (ctrl >> 2) & 0x0f;
 
+        #[cfg(feature = "defmt")]
+        defmt::info!("usb isr: tokdne ep={} tx={} pid={:#03x} bc={}", ep_num, is_tx, token_pid, bc);
+
         if ep_num < EP_COUNT {
             if !is_tx {
                 if token_pid == TOKEN_SETUP {
@@ -1176,6 +1204,12 @@ unsafe fn on_interrupt() {
                     STATE.ep_out_token[0].store(token_pid as u8, Ordering::Release);
                     set_odd(&STATE.ep_out_done_odd, 0, odd != 0);
                     STATE.ep_out_ready[0].store(bc, Ordering::Release);
+                    // Release TXSUSPENDTOKENBUSY immediately so the host can proceed to
+                    // the DATA/STATUS phase. Without this, the host sees no response and
+                    // times out (~5s) before retrying. Matches udc_kinetis.c behaviour.
+                    resume_ep0_token_processing();
+                    #[cfg(feature = "defmt")]
+                    defmt::info!("usb isr: setup done ctl={:#04x} inten={:#04x}", usb.ctl().read().0, usb.inten().read().0);
                 } else if token_pid == TOKEN_OUT {
                     #[cfg(feature = "defmt")]
                     if ep_num == 0 {
@@ -1192,7 +1226,11 @@ unsafe fn on_interrupt() {
                         STATE.ep_out_ready[ep_num].store(bc, Ordering::Release);
                     }
                 }
+                #[cfg(feature = "defmt")]
+                defmt::info!("usb isr: wake out ep={}", ep_num);
                 STATE.ep_out_wakers[ep_num].wake();
+                #[cfg(feature = "defmt")]
+                defmt::info!("usb isr: wake out ep={} done", ep_num);
             } else {
                 if ep_num == 0 && token_pid == TOKEN_IN {
                     let pa = STATE.pending_addr.load(Ordering::Acquire);
@@ -1203,11 +1241,19 @@ unsafe fn on_interrupt() {
                         defmt::info!("usb isr: address now {}", pa & 0x7f);
                     }
                 }
+                #[cfg(feature = "defmt")]
+                defmt::info!("usb isr: wake in ep={}", ep_num);
                 STATE.ep_in_wakers[ep_num].wake();
+                #[cfg(feature = "defmt")]
+                defmt::info!("usb isr: wake in ep={} done", ep_num);
             }
         }
 
+        #[cfg(feature = "defmt")]
+        defmt::info!("usb isr: tokdne cleared");
         usb.istat().write_value(pac::regs::Istat(ISTAT_TOKDNE));
+        #[cfg(feature = "defmt")]
+        defmt::info!("usb isr: tokdne done");
     }
 
     if istat & ISTAT_STALL != 0 {
@@ -1215,6 +1261,9 @@ unsafe fn on_interrupt() {
         defmt::warn!("usb isr: stall");
 
         endpoint_write(0, endpoint_read(0) & !ENDPT_EPSTALL);
+        // Re-prime ep0out for the next SETUP after stall; without this the host's retry
+        // SETUP hits OWN=0, causing DMAERR and a corrupted transaction.
+        prime_ep0_out_setup();
         usb.istat().write_value(pac::regs::Istat(ISTAT_STALL));
     }
 
@@ -1237,4 +1286,7 @@ unsafe fn on_interrupt() {
         usb.errstat().write_value(pac::regs::Errstat(0xff));
         usb.istat().write_value(pac::regs::Istat(ISTAT_ERROR));
     }
+
+    #[cfg(feature = "defmt")]
+    defmt::info!("usb isr: exit");
 }
