@@ -997,44 +997,35 @@ impl<'d> DmaChannel<'d> {
         }
 
         let half_len = total_len / 2;
-        let hw_size = W::size().to_hw_size();
-        let soff = W::size().bytes() as i16;
-        let nbytes = W::size().bytes() as u32;
-        let attr = ((hw_size as u16) << 8) | (hw_size as u16);
-        let slast = -((total_len as i32) * (W::size().bytes() as i32));
 
-        // CSR:
-        //   Bit 2  INTHALF  — interrupt when CITER reaches CEIL(BITER/2)
-        //   Bit 1  INTMAJOR — interrupt on major-loop completion
-        //   Bit 3  DREQ=0   — do NOT clear ERQ (keep running)
-        //   Bit 4  ESG=0    — no scatter-gather; SLAST handles the wrap-around
-        const CSR: u16 = 0x0006; // INTHALF | INTMAJOR
-
-        let tcd = Tcd {
-            saddr: buf as u32,
-            soff,
-            attr,
-            nbytes,
-            slast,
-            daddr: peri_addr as u32,
-            doff: 0,
-            citer: total_len as u16,
-            dlast_sga: 0,
-            csr: CSR,
-            biter: total_len as u16,
-        };
-
-        let t = self.tcd();
-        Self::reset_channel_state(&t);
-        fence(Ordering::Release);
-
-        unsafe { self.set_request_source(request) };
-        unsafe { self.load_tcd(&tcd) };
+        // Reuse the existing setup_transfers infrastructure:
+        //   circular=true  → DREQ=0 (keep ERQ alive) + SLAST resets SADDR
+        //   half_transfer_interrupt → INTHALF fires at the midpoint
+        //   complete_transfer_interrupt → INTMAJOR fires at end of each pass
+        //   software=false → hardware peripheral ERQ drives the transfer
+        unsafe {
+            self.setup_transfers(DmaTransferParameters {
+                src_ptr: buf as *const W,
+                dst_ptr: peri_addr,
+                dst_count: total_len,
+                src_incr: true,
+                dst_incr: false,
+                circular: true,
+                software: false,
+                options: TransferOptions {
+                    half_transfer_interrupt: true,
+                    complete_transfer_interrupt: true,
+                    priority: Priority::LOWEST,
+                },
+            });
+            self.set_request_source(request);
+        }
 
         fence(Ordering::Release);
 
         cortex_m::peripheral::NVIC::unpend(self.channel.interrupt());
 
+        let t = self.tcd();
         t.ch_csr().modify(|w| {
             w.set_erq(true);
             w.set_earq(true);
