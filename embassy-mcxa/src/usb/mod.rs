@@ -65,11 +65,24 @@ struct BdEntry {
 #[repr(C, align(512))]
 struct BdtBuffer([u8; 512]);
 
+// A `static`-friendly wrapper around `UnsafeCell` for hardware-shared buffers.
+//
+// `UnsafeCell<T>` is not `Sync`, so it cannot be placed in a `static` directly.
+// We cannot use `ConstStaticCell` or similar wrappers here because `BdtBuffer`
+// carries `#[repr(C, align(512))]` and wrapping it would break the alignment
+// guarantee required by the KHCI hardware.
+//
+// SAFETY of `unsafe impl Sync`: this crate targets single-core MCXA devices, so
+// there is no true concurrent access. The only preemption is from the USB0 ISR.
+// Access is made safe by three invariants upheld throughout this driver:
+//   1. BDT entries are handed off to the peripheral atomically via the `BD_OWN`
+//      bit with a `Release` fence; the CPU only touches an entry after reading
+//      `OWN=0` through a volatile load.
+//   2. Endpoint data buffers are only read/written on the CPU side inside a
+//      `critical_section`, preventing ISR re-entry mid-copy.
+//   3. No `&mut` references to these statics are ever created across the ISR
+//      boundary; all mutation goes through raw pointers and volatile ops.
 struct SyncUnsafeCell<T>(UnsafeCell<T>);
-
-// SAFETY: These statics are only accessed through this driver. Mutation is
-// synchronized either by endpoint ownership/BDT state or by short critical
-// sections when copying packet data.
 unsafe impl<T> Sync for SyncUnsafeCell<T> {}
 
 impl<T> SyncUnsafeCell<T> {
