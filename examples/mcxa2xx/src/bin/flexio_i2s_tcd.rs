@@ -183,32 +183,22 @@ impl<'d> FlexioI2sTx<'d> {
 
     /// Start a continuous ping-pong DMA stream.
     ///
+    /// Consumes both buffers into the returned [`PingPongTransfer`], which
+    /// gives them back one at a time (via [`PingPongTransfer::idle_buf_mut`])
+    /// after each half completes — exactly like `RingBuffer` does for RX.
+    ///
     /// Fill `buf_a` before calling so the first buffer period has valid audio.
-    ///
-    /// # Safety
-    ///
-    /// `buf_a` and `buf_b` must point into `'static` storage that remains
-    /// valid for the life of the returned `PingPongTransfer`.  Only write to a
-    /// buffer after `next_half()` reports it finished — the hardware is reading
-    /// from it until then.
-    pub unsafe fn start_ping_pong(
+    pub fn start_ping_pong(
         &mut self,
         pool: &'static mut PingPongPool,
-        buf_a: *const u32,
-        buf_b: *const u32,
-        len: usize,
-    ) -> Result<PingPongTransfer<'_>, Error> {
+        buf_a: &'static mut [u32; BUF_LEN],
+        buf_b: &'static mut [u32; BUF_LEN],
+    ) -> Result<PingPongTransfer<'_, u32>, Error> {
         let peri_addr = self.shifter.dma_address_bis();
+        // SAFETY: peri_addr is the FlexIO shifter register, always valid.
         unsafe {
             self.dma
-                .ping_pong_write_to_peripheral(
-                    pool,
-                    buf_a,
-                    buf_b,
-                    len,
-                    peri_addr,
-                    Shifter::<0>::dma_request(),
-                )
+                .ping_pong_write_to_peripheral(pool, buf_a, buf_b, peri_addr, Shifter::<0>::dma_request())
                 .map_err(Error::from)
         }
     }
@@ -257,7 +247,7 @@ async fn main(_spawner: Spawner) {
     // Each u32 word packs one 16-bit left sample (upper half) and one 16-bit
     // right sample (lower half).
     let mut phase = 0u32;
-    let mut fill = |buf: &mut [u32; BUF_LEN]| {
+    let mut fill = |buf: &mut [u32]| {
         for word in buf.iter_mut() {
             let s: u32 = if phase < 256 { 0x3FFF } else { 0xC001 };
             *word = (s << 16) | s;
@@ -271,24 +261,21 @@ async fn main(_spawner: Spawner) {
     fill(buf_b);
 
     // Start the circular TCD chain.  DMA immediately begins streaming buf_a.
-    // SAFETY: buf_a and buf_b are 'static, and we only write to whichever
-    // buffer next_half() reports as finished (the one DMA is no longer using).
-    let mut stream = unsafe {
-        i2s.start_ping_pong(tcds, buf_a.as_ptr(), buf_b.as_ptr(), BUF_LEN)
-            .unwrap()
-    };
+    // Both buffers are consumed into the transfer; the borrow checker enforces
+    // the ownership protocol from here on.
+    let mut stream = i2s.start_ping_pong(tcds, buf_a, buf_b).unwrap();
 
-    // Main loop: refill whichever buffer the hardware just finished.
+    // Main loop: wait for a half to finish, refill it, repeat.
     //
-    //   half == 0 → buf_a just finished (DMA is now streaming buf_b)  → refill buf_a
-    //   half == 1 → buf_b just finished (DMA is now streaming buf_a)  → refill buf_b
+    // `idle_buf_mut(idx)` returns a `&mut [u32]` to the buffer that just
+    // finished (the one DMA is no longer reading).  Holding that `&mut`
+    // prevents calling `next_half()` again — the borrow checker statically
+    // enforces that we stop writing before the DMA can loop back to that buffer.
     //
-    // The CPU has exactly one buffer period (512 frames ≈ 10.9 ms at 46875 Hz)
-    // to complete the fill before that buffer is needed again.
+    // The CPU has one full buffer period (512 frames ≈ 10.9 ms at 46 875 Hz)
+    // to complete the fill before the hardware needs it again.
     loop {
-        match stream.next_half().await.unwrap() {
-            0 => fill(buf_a),
-            _ => fill(buf_b),
-        }
+        let idx = stream.next_half().await.unwrap();
+        fill(stream.idle_buf_mut(idx));
     }
 }

@@ -867,21 +867,22 @@ impl DmaChannel<'_> {
     ///
     /// # Safety
     ///
-    /// * `buf_a` and `buf_b` must point to valid, equally-sized buffers of
-    ///   `len` elements that remain valid for the life of the returned transfer.
     /// * Only write to a buffer after [`PingPongTransfer::next_half`] reports
-    ///   that it has finished — hardware is reading from it until then.
+    ///   that it finished — hardware is reading from it until then.  Use
+    ///   [`PingPongTransfer::idle_buf_mut`] to get the correct slice; the borrow
+    ///   checker then enforces the protocol statically.
     /// * `peri_addr` must be a valid, writable peripheral data register.
+    /// * Both slices must have equal, non-zero length ≤ [`DMA_MAX_TRANSFER_SIZE`].
     pub unsafe fn ping_pong_write_to_peripheral<W: Word>(
         &mut self,
         pool: &'static mut PingPongPool,
-        buf_a: *const W,
-        buf_b: *const W,
-        len: usize,
+        buf_a: &'static mut [W],
+        buf_b: &'static mut [W],
         peri_addr: *mut W,
         request: DmaRequest,
-    ) -> Result<PingPongTransfer<'_>, InvalidParameters> {
-        if len == 0 || len > DMA_MAX_TRANSFER_SIZE {
+    ) -> Result<PingPongTransfer<'_, W>, InvalidParameters> {
+        let len = buf_a.len();
+        if len == 0 || len > DMA_MAX_TRANSFER_SIZE || buf_b.len() != len {
             return Err(InvalidParameters);
         }
 
@@ -902,7 +903,7 @@ impl DmaChannel<'_> {
         const CSR: u16 = 0x0012; // ESG | INTMAJOR
 
         pool.tcds[0] = Tcd {
-            saddr: buf_a as u32,
+            saddr: buf_a.as_ptr() as u32,
             soff,
             attr,
             nbytes,
@@ -915,7 +916,7 @@ impl DmaChannel<'_> {
             biter: count,
         };
         pool.tcds[1] = Tcd {
-            saddr: buf_b as u32,
+            saddr: buf_b.as_ptr() as u32,
             soff,
             attr,
             nbytes,
@@ -949,7 +950,7 @@ impl DmaChannel<'_> {
             w.set_earq(true);
         });
 
-        Ok(PingPongTransfer::new(self.reborrow()))
+        Ok(PingPongTransfer::new(self.reborrow(), buf_a, buf_b))
     }
 
     /// Read data from a peripheral register to memory.
@@ -1836,21 +1837,53 @@ impl<'a> Drop for Transfer<'a> {
 /// before the next `next_half` call.
 ///
 /// Dropping the transfer stops the DMA and releases the channel.
-pub struct PingPongTransfer<'d> {
+/// An infinite ping-pong DMA stream to a peripheral, backed by two alternating
+/// owned buffers.
+///
+/// The type owns both buffers (stored as raw pointers like [`RingBuffer`] does
+/// for its receive buffer) so the DMA can read from whichever is active without
+/// conflicting with the caller's write access to the idle one.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// loop {
+///     let idx = stream.next_half().await?;   // wait — async, no borrow held
+///     fill(stream.idle_buf_mut(idx));         // fill — sync &mut, borrow released
+/// }                                           //        before next await
+/// ```
+///
+/// The borrow checker enforces the protocol: `idle_buf_mut` takes `&mut self`,
+/// so the `&mut [W]` it returns *must* be dropped before the next `next_half()`
+/// call (which also needs `&mut self`).  Dropping it is what signals "I'm done
+/// — hand this buffer back to the DMA next time round."
+pub struct PingPongTransfer<'d, W: Word> {
     channel: DmaChannel<'d>,
-    /// Alternates 0/1 per call to track which half just completed.
+    /// Raw pointers mirror the RingBuffer pattern: DMA reads from these
+    /// concurrently, so we must not hold a live Rust `&mut` while it does.
+    buf_a: NonNull<[W]>,
+    buf_b: NonNull<[W]>,
+    /// 0 = buf_a just completed; 1 = buf_b just completed.
     half: u8,
+    /// Ties lifetime to the original `&'static mut [W]` slices.
+    _lt: PhantomData<&'static mut W>,
 }
 
-impl<'d> PingPongTransfer<'d> {
-    fn new(channel: DmaChannel<'d>) -> Self {
-        Self { channel, half: 0 }
+impl<'d, W: Word> PingPongTransfer<'d, W> {
+    fn new(channel: DmaChannel<'d>, buf_a: &'static mut [W], buf_b: &'static mut [W]) -> Self {
+        Self {
+            channel,
+            buf_a: NonNull::from(buf_a),
+            buf_b: NonNull::from(buf_b),
+            half: 0,
+            _lt: PhantomData,
+        }
     }
 
     /// Wait until the next buffer finishes transmitting.
     ///
     /// Returns `Ok(0)` when `buf_a` completed, `Ok(1)` when `buf_b` completed.
-    /// Calls alternate strictly: A, B, A, B, …
+    /// Alternates strictly A, B, A, B, …
     pub async fn next_half(&mut self) -> Result<u8, TransferErrors> {
         use core::future::poll_fn;
         poll_fn(|cx| {
@@ -1874,9 +1907,34 @@ impl<'d> PingPongTransfer<'d> {
         })
         .await
     }
+
+    /// Return a mutable slice to the buffer that [`next_half`](Self::next_half)
+    /// just reported as idle.
+    ///
+    /// Pass the `idx` value returned by `next_half` directly:
+    ///
+    /// ```rust,ignore
+    /// let idx = stream.next_half().await?;
+    /// fill(stream.idle_buf_mut(idx));
+    /// ```
+    ///
+    /// The returned `&mut [W]` borrows `self` mutably, so the borrow checker
+    /// prevents calling `next_half` again (or `idle_buf_mut` again) until the
+    /// slice is dropped.  This statically enforces the ping-pong ownership
+    /// protocol without any runtime checks.
+    pub fn idle_buf_mut(&mut self, idx: u8) -> &mut [W] {
+        // SAFETY: `idx` came from `next_half()`, which only returns after the
+        // corresponding TCD's INTMAJOR interrupt fired.  At that point the DMA
+        // has moved to the *other* TCD and will not read from this buffer again
+        // until after the next `next_half()` call.  The borrow on `self` (via
+        // `&mut self`) prevents calling `next_half()` while this `&mut [W]` is
+        // live, so the DMA cannot loop back to this buffer before we're done.
+        let mut ptr = if idx == 0 { self.buf_a } else { self.buf_b };
+        unsafe { ptr.as_mut() }
+    }
 }
 
-impl<'d> Drop for PingPongTransfer<'d> {
+impl<'d, W: Word> Drop for PingPongTransfer<'d, W> {
     fn drop(&mut self) {
         let t = self.channel.tcd();
         let irq = self.channel.channel.interrupt();
