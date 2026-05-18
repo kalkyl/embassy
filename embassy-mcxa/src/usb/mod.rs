@@ -26,6 +26,8 @@ pub(crate) mod pac;
 // MCXA256 USB0 base address from the local nxp-pac mcxa256 metadata.
 const USB_BASE: usize = 0x400A_4000;
 const EP_COUNT: usize = 8;
+const HW_EP_COUNT: usize = 16;
+const BDT_ENTRY_COUNT: usize = HW_EP_COUNT * 4;
 const EP0_MASK: u8 = 1;
 const OUT_EMPTY: u16 = u16::MAX;
 
@@ -770,7 +772,7 @@ fn bdt_ptr() -> *mut BdEntry {
 }
 
 fn bd_ptr(index: usize) -> *mut BdEntry {
-    debug_assert!(index < 64);
+    debug_assert!(index < BDT_ENTRY_COUNT);
     bdt_ptr().wrapping_add(index)
 }
 
@@ -847,8 +849,9 @@ fn copy_to_in_buf(ep: usize, odd: bool, data: &[u8]) {
 }
 
 fn clear_bdt() {
-    for i in 0..64 {
-        // SAFETY: The BDT static contains exactly 64 KHCI entries.
+    for i in 0..BDT_ENTRY_COUNT {
+        // SAFETY: The BDT static contains exactly one entry for each
+        // endpoint/direction/even-odd tuple in the KHCI block.
         unsafe {
             write_volatile(core::ptr::addr_of_mut!((*bd_ptr(i)).ctrl), 0);
             write_volatile(core::ptr::addr_of_mut!((*bd_ptr(i)).addr), 0);
@@ -989,7 +992,7 @@ fn on_interrupt() {
     let istat = usb.istat().read().0;
 
     if istat & ISTAT_USBRST != 0 {
-        for ep in 1..EP_COUNT {
+        for ep in 1..HW_EP_COUNT {
             endpoint_write(ep, 0);
         }
 
@@ -1071,14 +1074,6 @@ fn on_interrupt() {
     }
 
     if istat & ISTAT_ERROR != 0 {
-        #[cfg(feature = "defmt")]
-        defmt::trace!(
-            "usb isr: error errstat={:#04x} stat={:#04x} ctl={:#04x}",
-            usb.errstat().read().0,
-            usb.stat().read().0,
-            usb.ctl().read().0,
-        );
-
         usb.errstat().write_value(pac::regs::Errstat(0xff));
         usb.istat().write_value(pac::regs::Istat(ISTAT_ERROR));
     }
