@@ -67,6 +67,9 @@ struct BdtBuffer([u8; 512]);
 
 struct SyncUnsafeCell<T>(UnsafeCell<T>);
 
+// SAFETY: These statics are only accessed through this driver. Mutation is
+// synchronized either by endpoint ownership/BDT state or by short critical
+// sections when copying packet data.
 unsafe impl<T> Sync for SyncUnsafeCell<T> {}
 
 impl<T> SyncUnsafeCell<T> {
@@ -190,7 +193,7 @@ pub struct InterruptHandler {
 
 impl Handler<interrupt::typelevel::USB0> for InterruptHandler {
     unsafe fn on_interrupt() {
-        unsafe { on_interrupt() }
+        on_interrupt()
     }
 }
 
@@ -281,6 +284,8 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
         self.ep_out_max_packet[0] = control_max_packet_size;
 
         configure_usb_clock();
+        // SAFETY: The driver owns USB0 through `Peri<'d, USB0>` and performs
+        // peripheral clock/reset setup before enabling the USB interrupt.
         unsafe {
             _ = enable_and_reset::<USB0>(&NoConfig);
         }
@@ -333,6 +338,8 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
             .write(|w| w.set_dppullupnonotg(pac::vals::Dppullupnonotg::EN_DEVICE_DP_PU));
 
         interrupt::typelevel::USB0::unpend();
+        // SAFETY: The interrupt handler is bound by `Driver::new`, and USB0 is
+        // fully initialized before the interrupt is unmasked.
         unsafe {
             interrupt::typelevel::USB0::enable();
         }
@@ -662,6 +669,8 @@ impl embassy_usb_driver::EndpointIn for EndpointIn<'_> {
 }
 
 fn usb() -> pac::Usb {
+    // SAFETY: USB0 is a singleton peripheral. Access is serialized by the driver
+    // APIs and the USB0 interrupt handler.
     unsafe { pac::Usb::from_ptr(USB_BASE as *mut ()) }
 }
 
@@ -761,20 +770,27 @@ fn bdt_ptr() -> *mut BdEntry {
 }
 
 fn bd_ptr(index: usize) -> *mut BdEntry {
-    unsafe { bdt_ptr().add(index) }
+    debug_assert!(index < 64);
+    bdt_ptr().wrapping_add(index)
 }
 
 fn bd_ctrl(index: usize) -> u32 {
+    // SAFETY: `bd_ptr` points into the 512-byte aligned BDT static and callers
+    // only pass KHCI BDT indices.
     unsafe { read_volatile(core::ptr::addr_of!((*bd_ptr(index)).ctrl)) }
 }
 
 fn bd_release(index: usize) {
+    // SAFETY: `index` selects a BDT entry owned by this driver. Volatile writes
+    // are required because the USB peripheral reads these fields asynchronously.
     unsafe {
         write_volatile(core::ptr::addr_of_mut!((*bd_ptr(index)).ctrl), 0);
     }
 }
 
 fn bd_stall(index: usize) {
+    // SAFETY: `index` selects a BDT entry owned by this driver. The release
+    // fence ensures descriptor contents are visible before OWN is set.
     unsafe {
         fence(Ordering::Release);
         write_volatile(
@@ -786,6 +802,9 @@ fn bd_stall(index: usize) {
 
 fn bd_prime(index: usize, buf: *const u8, len: u16, data1: bool) {
     let ctrl = ((len as u32) << 16) | BD_OWN | BD_DTS | if data1 { BD_DATA01 } else { 0 };
+    // SAFETY: `buf` points to one of the static endpoint buffers and remains
+    // valid while OWN is set. The descriptor is written with volatile stores
+    // because it is shared with the USB peripheral.
     unsafe {
         write_volatile(core::ptr::addr_of_mut!((*bd_ptr(index)).addr), buf as u32);
         fence(Ordering::Release);
@@ -794,20 +813,34 @@ fn bd_prime(index: usize, buf: *const u8, len: u16, data1: bool) {
 }
 
 fn out_buf_ptr(ep: usize, odd: bool) -> *const u8 {
+    debug_assert!(ep < EP_COUNT);
+    // SAFETY: Endpoint buffers are static and `ep`/`odd` select an in-bounds
+    // buffer used as DMA storage by USB0.
     unsafe { (*EP_BUF_OUT.get())[ep][odd as usize].as_ptr() }
 }
 
 fn in_buf_ptr(ep: usize, odd: bool) -> *const u8 {
+    debug_assert!(ep < EP_COUNT);
+    // SAFETY: Endpoint buffers are static and `ep`/`odd` select an in-bounds
+    // buffer used as DMA storage by USB0.
     unsafe { (*EP_BUF_IN.get())[ep][odd as usize].as_ptr() }
 }
 
 fn copy_from_out_buf(ep: usize, odd: bool, buf: &mut [u8]) {
+    debug_assert!(ep < EP_COUNT);
+    debug_assert!(buf.len() <= 64);
+    // SAFETY: The interrupt marks an OUT buffer ready only after USB0 clears
+    // OWN. The critical section prevents racing with re-priming this buffer.
     critical_section::with(|_| unsafe {
         buf.copy_from_slice(&(&(*EP_BUF_OUT.get())[ep][odd as usize])[..buf.len()]);
     });
 }
 
 fn copy_to_in_buf(ep: usize, odd: bool, data: &[u8]) {
+    debug_assert!(ep < EP_COUNT);
+    debug_assert!(data.len() <= 64);
+    // SAFETY: The selected IN buffer is filled before its BDT entry is primed
+    // with OWN. The critical section prevents interrupt-side aliasing.
     critical_section::with(|_| unsafe {
         (&mut (*EP_BUF_IN.get())[ep][odd as usize])[..data.len()].copy_from_slice(data);
     });
@@ -815,6 +848,7 @@ fn copy_to_in_buf(ep: usize, odd: bool, data: &[u8]) {
 
 fn clear_bdt() {
     for i in 0..64 {
+        // SAFETY: The BDT static contains exactly 64 KHCI entries.
         unsafe {
             write_volatile(core::ptr::addr_of_mut!((*bd_ptr(i)).ctrl), 0);
             write_volatile(core::ptr::addr_of_mut!((*bd_ptr(i)).addr), 0);
@@ -944,7 +978,7 @@ async fn wait_in_done(ep: usize, abort: impl Fn() -> bool) -> Result<(), Endpoin
     .await
 }
 
-unsafe fn on_interrupt() {
+fn on_interrupt() {
     let usb = usb();
 
     let usbtrc0 = usb.usbtrc0().read();
