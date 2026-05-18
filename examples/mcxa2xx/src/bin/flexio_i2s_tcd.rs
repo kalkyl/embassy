@@ -9,7 +9,7 @@
 //! Two 32-byte-aligned TCDs live in `static` memory.  TCD A points to `BUF_A`
 //! and has `dlast_sga → &TCD_B`; TCD B points to `BUF_B` and has
 //! `dlast_sga → &TCD_A`.  Both have `INTMAJOR=1` so the DMA interrupt fires
-//! at the end of every buffer.  `PingPongTransfer::next_half()` awaits those
+//! at the end of every buffer.  `I2sStream::next_half()` awaits those
 //! interrupts and returns 0 (A done) or 1 (B done), giving the CPU a full
 //! buffer period to refill the idle half with no gap in the audio stream.
 //!
@@ -41,10 +41,6 @@ use embassy_mcxa::clocks::config::Div8;
 use static_cell::ConstStaticCell;
 use {defmt_rtt as _, embassy_mcxa as hal, panic_probe as _};
 
-// ---------------------------------------------------------------------------
-// Error types
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, defmt::Format)]
 pub enum Error {
     InvalidParameters,
@@ -63,23 +59,12 @@ impl From<TransferErrors> for Error {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Static DMA storage
-//
-// Both the TCD pool and the audio buffers must be 'static so that the
-// scatter-gather addresses and DMA source pointers remain valid forever.
-// ConstStaticCell gives safe one-shot initialisation without a Mutex.
-// ---------------------------------------------------------------------------
-
 const BUF_LEN: usize = 512;
 
 static TCDS: ConstStaticCell<PingPongPool> = ConstStaticCell::new(PingPongPool::new());
 static BUF_A: ConstStaticCell<[u32; BUF_LEN]> = ConstStaticCell::new([0; BUF_LEN]);
 static BUF_B: ConstStaticCell<[u32; BUF_LEN]> = ConstStaticCell::new([0; BUF_LEN]);
 
-// ---------------------------------------------------------------------------
-// Driver
-// ---------------------------------------------------------------------------
 
 pub struct FlexioI2sTx<'d> {
     shifter: Shifter<'d, 0>,
@@ -88,6 +73,32 @@ pub struct FlexioI2sTx<'d> {
     #[allow(dead_code)]
     ws_timer: FlexTimer<'d, 1>,
     dma: DmaChannel<'d>,
+}
+
+/// Active streaming state returned by [`FlexioI2sTx::start_stream`].
+pub struct I2sStream<'d> {
+    _shifter: Shifter<'d, 0>,
+    _bclk_timer: FlexTimer<'d, 0>,
+    _ws_timer: FlexTimer<'d, 1>,
+    transfer: PingPongTransfer<'d, u32>,
+}
+
+impl<'d> I2sStream<'d> {
+    /// Wait for the next buffer to finish transmitting.
+    ///
+    /// Returns `Ok(0)` when `buf_a` completed, `Ok(1)` when `buf_b` completed.
+    pub async fn next_half(&mut self) -> Result<u8, Error> {
+        self.transfer.next_half().await.map_err(Error::from)
+    }
+
+    /// Refill the buffer that [`next_half`] just reported as idle.
+    ///
+    /// Calls `f` with a `&mut [u32]` slice of that buffer.  Because this takes
+    /// `&mut self`, the borrow checker prevents calling `next_half` again until
+    /// `f` returns — enforcing that writes finish before the DMA loops back.
+    pub fn fill_idle<F: FnOnce(&mut [u32])>(&mut self, idx: u8, f: F) {
+        self.transfer.fill_idle(idx, f);
+    }
 }
 
 impl<'d> FlexioI2sTx<'d> {
@@ -181,32 +192,45 @@ impl<'d> FlexioI2sTx<'d> {
         }
     }
 
-    /// Start a continuous ping-pong DMA stream.
+    /// Consume the driver and start a continuous ping-pong DMA stream.
     ///
-    /// Consumes both buffers into the returned [`PingPongTransfer`], which
-    /// gives them back one at a time (via [`PingPongTransfer::idle_buf_mut`])
-    /// after each half completes — exactly like `RingBuffer` does for RX.
+    /// Both audio buffers and the TCD pool are passed in as `&'static mut`
+    /// references (obtained from `ConstStaticCell::take()`).  They are consumed
+    /// here, so no other code holds a live alias while DMA is running.
     ///
-    /// Fill `buf_a` before calling so the first buffer period has valid audio.
-    pub fn start_ping_pong(
-        &mut self,
+    /// Pre-fill `buf_a` (and optionally `buf_b`) before calling so the first
+    /// buffer period contains valid audio rather than silence.
+    pub fn start_stream(
+        self,
         pool: &'static mut PingPongPool,
-        buf_a: &'static mut [u32; BUF_LEN],
-        buf_b: &'static mut [u32; BUF_LEN],
-    ) -> Result<PingPongTransfer<'_, u32>, Error> {
+        buf_a: &'static mut [u32],
+        buf_b: &'static mut [u32],
+    ) -> Result<I2sStream<'d>, Error> {
         let peri_addr = self.shifter.dma_address_bis();
-        // SAFETY: peri_addr is the FlexIO shifter register, always valid.
-        unsafe {
-            self.dma
-                .ping_pong_write_to_peripheral(pool, buf_a, buf_b, peri_addr, Shifter::<0>::dma_request())
-                .map_err(Error::from)
-        }
+        let len = buf_a.len();
+        // SAFETY:
+        // - buf_a / buf_b are 'static, and we consume them here (no live &mut alias).
+        // - len is their known length; both slices were created with the same BUF_LEN.
+        // - peri_addr is the FlexIO shifter register, always valid.
+        // - After this call the only CPU write path is through I2sStream::fill_idle.
+        let transfer = unsafe {
+            self.dma.ping_pong_write_to_peripheral(
+                pool,
+                buf_a.as_mut_ptr(),
+                buf_b.as_mut_ptr(),
+                len,
+                peri_addr,
+                Shifter::<0>::dma_request(),
+            )
+        }?;
+        Ok(I2sStream {
+            _shifter: self.shifter,
+            _bclk_timer: self.bclk_timer,
+            _ws_timer: self.ws_timer,
+            transfer,
+        })
     }
 }
-
-// ---------------------------------------------------------------------------
-// Application
-// ---------------------------------------------------------------------------
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -226,7 +250,7 @@ async fn main(_spawner: Spawner) {
     let flexio = Flexio::new(p.FLEXIO0, flexio_cfg).expect("FlexIO init failed");
     let (mut shifters, mut timers) = flexio.split();
 
-    let mut i2s = FlexioI2sTx::new(
+    let i2s = FlexioI2sTx::new(
         shifters.take::<0>().unwrap(),
         timers.take::<0>().unwrap(),
         timers.take::<1>().unwrap(),
@@ -237,11 +261,6 @@ async fn main(_spawner: Spawner) {
         48_000,
         15_000_000,
     );
-
-    // Take ownership of the static buffers and TCD pool.
-    let buf_a: &'static mut [u32; BUF_LEN] = BUF_A.take();
-    let buf_b: &'static mut [u32; BUF_LEN] = BUF_B.take();
-    let tcds: &'static mut PingPongPool = TCDS.take();
 
     // Square-wave generator used as a stand-in for a real audio source.
     // Each u32 word packs one 16-bit left sample (upper half) and one 16-bit
@@ -254,28 +273,15 @@ async fn main(_spawner: Spawner) {
             phase = (phase + 1) % 512;
         }
     };
-
-    // Pre-fill both halves before handing their addresses to DMA so the first
-    // two buffer periods never output silence.
-    fill(buf_a);
-    fill(buf_b);
-
-    // Start the circular TCD chain.  DMA immediately begins streaming buf_a.
-    // Both buffers are consumed into the transfer; the borrow checker enforces
-    // the ownership protocol from here on.
-    let mut stream = i2s.start_ping_pong(tcds, buf_a, buf_b).unwrap();
+    
+    let mut stream = i2s.start_stream(TCDS.take(), BUF_A.take(), BUF_B.take()).unwrap();
 
     // Main loop: wait for a half to finish, refill it, repeat.
-    //
-    // `idle_buf_mut(idx)` returns a `&mut [u32]` to the buffer that just
-    // finished (the one DMA is no longer reading).  Holding that `&mut`
-    // prevents calling `next_half()` again — the borrow checker statically
-    // enforces that we stop writing before the DMA can loop back to that buffer.
     //
     // The CPU has one full buffer period (512 frames ≈ 10.9 ms at 46 875 Hz)
     // to complete the fill before the hardware needs it again.
     loop {
         let idx = stream.next_half().await.unwrap();
-        fill(stream.idle_buf_mut(idx));
+        stream.fill_idle(idx, |buf| fill(buf));
     }
 }

@@ -443,7 +443,7 @@ impl<'a> DmaChannel<'a> {
     }
 }
 
-impl DmaChannel<'_> {
+impl<'d> DmaChannel<'d> {
     /// Reborrow the DmaChannel with a shorter lifetime.
     pub fn reborrow(&mut self) -> DmaChannel<'_> {
         DmaChannel {
@@ -867,22 +867,24 @@ impl DmaChannel<'_> {
     ///
     /// # Safety
     ///
-    /// * Only write to a buffer after [`PingPongTransfer::next_half`] reports
-    ///   that it finished — hardware is reading from it until then.  Use
-    ///   [`PingPongTransfer::idle_buf_mut`] to get the correct slice; the borrow
-    ///   checker then enforces the protocol statically.
+    /// * `buf_a` and `buf_b` must point to valid, equally-sized regions of
+    ///   `len` `W`-words that remain valid for the life of the transfer.
+    ///   Obtain these via `(&'static mut [W]).as_mut_ptr()` — the `&'static mut`
+    ///   must be consumed (not kept alive) so that no live Rust alias overlaps
+    ///   with the DMA access window.
+    /// * Only write to a buffer inside [`PingPongTransfer::fill_idle`] after
+    ///   [`PingPongTransfer::next_half`] reports it finished.
     /// * `peri_addr` must be a valid, writable peripheral data register.
-    /// * Both slices must have equal, non-zero length ≤ [`DMA_MAX_TRANSFER_SIZE`].
     pub unsafe fn ping_pong_write_to_peripheral<W: Word>(
-        &mut self,
+        self,
         pool: &'static mut PingPongPool,
-        buf_a: &'static mut [W],
-        buf_b: &'static mut [W],
+        buf_a: *mut W,
+        buf_b: *mut W,
+        len: usize,
         peri_addr: *mut W,
         request: DmaRequest,
-    ) -> Result<PingPongTransfer<'_, W>, InvalidParameters> {
-        let len = buf_a.len();
-        if len == 0 || len > DMA_MAX_TRANSFER_SIZE || buf_b.len() != len {
+    ) -> Result<PingPongTransfer<'d, W>, InvalidParameters> {
+        if len == 0 || len > DMA_MAX_TRANSFER_SIZE {
             return Err(InvalidParameters);
         }
 
@@ -903,7 +905,7 @@ impl DmaChannel<'_> {
         const CSR: u16 = 0x0012; // ESG | INTMAJOR
 
         pool.tcds[0] = Tcd {
-            saddr: buf_a.as_ptr() as u32,
+            saddr: buf_a as u32,
             soff,
             attr,
             nbytes,
@@ -916,7 +918,7 @@ impl DmaChannel<'_> {
             biter: count,
         };
         pool.tcds[1] = Tcd {
-            saddr: buf_b.as_ptr() as u32,
+            saddr: buf_b as u32,
             soff,
             attr,
             nbytes,
@@ -950,7 +952,7 @@ impl DmaChannel<'_> {
             w.set_earq(true);
         });
 
-        Ok(PingPongTransfer::new(self.reborrow(), buf_a, buf_b))
+        Ok(PingPongTransfer::new(self, buf_a, buf_b, len))
     }
 
     /// Read data from a peripheral register to memory.
@@ -1838,46 +1840,53 @@ impl<'a> Drop for Transfer<'a> {
 ///
 /// Dropping the transfer stops the DMA and releases the channel.
 /// An infinite ping-pong DMA stream to a peripheral, backed by two alternating
-/// owned buffers.
+/// caller-managed buffers.
 ///
-/// The type owns both buffers (stored as raw pointers like [`RingBuffer`] does
-/// for its receive buffer) so the DMA can read from whichever is active without
-/// conflicting with the caller's write access to the idle one.
+/// # Why raw pointers instead of `&'static mut`
+///
+/// DMA buffers are concurrently read by hardware.  A Rust `&'static mut [W]`
+/// carries `noalias` semantics — the compiler assumes nothing else can touch
+/// that memory while the reference is live.  Handing the pointer to DMA would
+/// violate that assumption even after the reference is gone, because the TCDs
+/// still point into the same allocation.
+///
+/// Instead the caller provides raw `*mut W` pointers obtained from
+/// `UnsafeCell`-wrapped statics, which explicitly opt out of `noalias`.  The
+/// `fill_idle` closure-based API then creates a short-lived `&mut [W]` only
+/// when the DMA is provably on the *other* buffer, so no aliasing conflict
+/// exists during that window.
 ///
 /// # Usage
 ///
 /// ```rust,ignore
 /// loop {
-///     let idx = stream.next_half().await?;   // wait — async, no borrow held
-///     fill(stream.idle_buf_mut(idx));         // fill — sync &mut, borrow released
-/// }                                           //        before next await
+///     let idx = stream.next_half().await?;
+///     stream.fill_idle(idx, |buf| { /* write samples into buf */ });
+/// }
 /// ```
 ///
-/// The borrow checker enforces the protocol: `idle_buf_mut` takes `&mut self`,
-/// so the `&mut [W]` it returns *must* be dropped before the next `next_half()`
-/// call (which also needs `&mut self`).  Dropping it is what signals "I'm done
-/// — hand this buffer back to the DMA next time round."
+/// `fill_idle` takes `&mut self`, so the borrow checker prevents calling
+/// `next_half` (also `&mut self`) until the closure returns, statically
+/// enforcing the ping-pong ownership protocol.
 pub struct PingPongTransfer<'d, W: Word> {
     channel: DmaChannel<'d>,
-    /// Raw pointers mirror the RingBuffer pattern: DMA reads from these
-    /// concurrently, so we must not hold a live Rust `&mut` while it does.
-    buf_a: NonNull<[W]>,
-    buf_b: NonNull<[W]>,
+    /// Raw pointers into `UnsafeCell`-backed statics.  Never derived from a
+    /// Rust `&mut` reference, so no `noalias` constraint is asserted.
+    buf_a: *mut W,
+    buf_b: *mut W,
+    len: usize,
     /// 0 = buf_a just completed; 1 = buf_b just completed.
     half: u8,
-    /// Ties lifetime to the original `&'static mut [W]` slices.
-    _lt: PhantomData<&'static mut W>,
+    _phantom: PhantomData<W>,
 }
 
+// SAFETY: DmaChannel is Send; the raw pointers are into static storage and
+// access is serialised by the ping-pong protocol.
+unsafe impl<W: Word> Send for PingPongTransfer<'_, W> {}
+
 impl<'d, W: Word> PingPongTransfer<'d, W> {
-    fn new(channel: DmaChannel<'d>, buf_a: &'static mut [W], buf_b: &'static mut [W]) -> Self {
-        Self {
-            channel,
-            buf_a: NonNull::from(buf_a),
-            buf_b: NonNull::from(buf_b),
-            half: 0,
-            _lt: PhantomData,
-        }
+    fn new(channel: DmaChannel<'d>, buf_a: *mut W, buf_b: *mut W, len: usize) -> Self {
+        Self { channel, buf_a, buf_b, len, half: 0, _phantom: PhantomData }
     }
 
     /// Wait until the next buffer finishes transmitting.
@@ -1908,29 +1917,27 @@ impl<'d, W: Word> PingPongTransfer<'d, W> {
         .await
     }
 
-    /// Return a mutable slice to the buffer that [`next_half`](Self::next_half)
-    /// just reported as idle.
-    ///
-    /// Pass the `idx` value returned by `next_half` directly:
+    /// Call `f` with a mutable slice of the buffer that [`next_half`] just
+    /// reported as idle (the one DMA is no longer reading from).
     ///
     /// ```rust,ignore
     /// let idx = stream.next_half().await?;
-    /// fill(stream.idle_buf_mut(idx));
+    /// stream.fill_idle(idx, |buf| generate_audio(buf));
     /// ```
     ///
-    /// The returned `&mut [W]` borrows `self` mutably, so the borrow checker
-    /// prevents calling `next_half` again (or `idle_buf_mut` again) until the
-    /// slice is dropped.  This statically enforces the ping-pong ownership
-    /// protocol without any runtime checks.
-    pub fn idle_buf_mut(&mut self, idx: u8) -> &mut [W] {
-        // SAFETY: `idx` came from `next_half()`, which only returns after the
-        // corresponding TCD's INTMAJOR interrupt fired.  At that point the DMA
-        // has moved to the *other* TCD and will not read from this buffer again
-        // until after the next `next_half()` call.  The borrow on `self` (via
-        // `&mut self`) prevents calling `next_half()` while this `&mut [W]` is
-        // live, so the DMA cannot loop back to this buffer before we're done.
-        let mut ptr = if idx == 0 { self.buf_a } else { self.buf_b };
-        unsafe { ptr.as_mut() }
+    /// Taking `&mut self` means the borrow checker prevents a concurrent
+    /// `next_half` call; the DMA cannot loop back to this buffer until
+    /// `fill_idle` returns and `next_half` is called again.
+    pub fn fill_idle<F: FnOnce(&mut [W])>(&mut self, idx: u8, f: F) {
+        // SAFETY: `idx` came from `next_half()`.  At that point the DMA has
+        // moved to the *other* TCD.  The raw pointers were obtained from
+        // `UnsafeCell`-backed statics (no `noalias` constraint), and no other
+        // Rust code can hold a live `&[W]` or `&mut [W]` to this memory because
+        // the only access path is through `&mut self` (this method) or the DMA
+        // hardware, and the two are temporally disjoint.
+        let ptr = if idx == 0 { self.buf_a } else { self.buf_b };
+        let slice = unsafe { core::slice::from_raw_parts_mut(ptr, self.len) };
+        f(slice);
     }
 }
 
