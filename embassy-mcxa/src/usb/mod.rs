@@ -23,8 +23,6 @@ use crate::peripherals::USB0;
 
 pub(crate) mod pac;
 
-// MCXA256 USB0 base address from the local nxp-pac mcxa256 metadata.
-const USB_BASE: usize = 0x400A_4000;
 const EP_COUNT: usize = 8;
 const HW_EP_COUNT: usize = 16;
 const BDT_ENTRY_COUNT: usize = HW_EP_COUNT * 4;
@@ -671,9 +669,9 @@ impl embassy_usb_driver::EndpointIn for EndpointIn<'_> {
 }
 
 fn usb() -> pac::Usb {
-    // SAFETY: USB0 is a singleton peripheral. Access is serialized by the driver
-    // APIs and the USB0 interrupt handler.
-    unsafe { pac::Usb::from_ptr(USB_BASE as *mut ()) }
+    // SAFETY: `USB0_BASE` comes from the same nxp-pac metadata as this local
+    // register shim. Access is serialized by the driver and USB0 interrupt.
+    unsafe { pac::Usb::from_ptr(pac::USB0_BASE as *mut ()) }
 }
 
 fn configure_usb_clock() {

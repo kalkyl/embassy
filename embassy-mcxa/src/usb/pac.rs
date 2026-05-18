@@ -1,6 +1,9 @@
 //! USB register block — sourced from nxp-pac d6e4d73 (mcxa256).
 #![allow(dead_code, non_camel_case_types, unused)]
 
+/// MCXA256 USB0 base address from the same nxp-pac metadata as this register block.
+pub const USB0_BASE: usize = 0x400A_4000;
+
 #[doc = "Array of registers: ENDPT"]
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct Endpoint {
