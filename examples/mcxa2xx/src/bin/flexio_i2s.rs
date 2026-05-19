@@ -178,7 +178,7 @@ impl<'d> FlexioI2sTx<'d> {
     /// Consume the driver and start streaming `buf` to the I2S shifter.
     /// Pre-fill both halves before calling so the stream opens with valid audio.
     pub fn start_stream(self, buf: &'static mut [u32]) -> Result<I2sStream<'d>, Error> {
-        let stream = self.sdma.start_stream_bis(buf)?;
+        let stream = self.sdma.start_stream_msb(buf)?;
         Ok(I2sStream {
             stream,
             _bclk_timer: self.bclk_timer,

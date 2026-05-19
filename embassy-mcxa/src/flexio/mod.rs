@@ -348,46 +348,55 @@ impl<'d, const N: usize> Shifter<'d, N> {
         });
     }
 
-    /// Write a 32-bit word to the shifter transmit buffer (SHIFTBUF).
+    /// Write a word to the shifter transmit buffer (LSB-first).
     ///
-    /// FlexIO shifts bit0 out first (LSB-first). Place data in the low bits of the word.
+    /// Bit 0 of `data` is shifted out first, making this suitable for UART and SPI.
     #[inline]
     pub fn write_buffer(&mut self, data: u32) {
         self.info.regs().shiftbuf(N).write(|w| w.set_shiftbuf(data));
     }
 
-    /// Write a 32-bit word to the shifter via SHIFTBUFBIS (Bit-Swapped buffer).
+    /// Write a word to the shifter transmit buffer (MSB-first).
     ///
-    /// SHIFTBUFBIS maps bit0 of the written value to bit31 of the shift register,
-    /// so FlexIO shifts bit31 out first (MSB-first).
+    /// Bit 31 of `data` is shifted out first, making this suitable for I2S and other
+    /// MSB-first protocols.  Internally writes via SHIFTBUFBIS, which bit-reverses the
+    /// value before storing it.
     #[inline]
-    pub fn write_buffer_bis(&mut self, data: u32) {
+    pub fn write_buffer_msb(&mut self, data: u32) {
         self.info.regs().shiftbufbis(N).write(|w| w.set_shiftbufbis(data));
     }
 
-    /// Read a 32-bit word from the shifter receive buffer (SHIFTBUF).
+    /// Read a word from the shifter receive buffer (LSB-first).
+    ///
+    /// Bit 0 of the returned value was the first bit shifted in.  Reading clears the
+    /// shifter status flag.
     #[inline]
     pub fn read_buffer(&self) -> u32 {
         self.info.regs().shiftbuf(N).read().shiftbuf()
     }
 
-    /// Read from the shifter via SHIFTBUFBIS (Bit-Swapped buffer).
+    /// Read a word from the shifter receive buffer (MSB-first).
+    ///
+    /// Bit 31 of the returned value was the first bit shifted in.  Internally reads
+    /// via SHIFTBUFBIS, which bit-reverses the value on the way out.  Reading clears
+    /// the shifter status flag.
     #[inline]
-    pub fn read_buffer_bis(&self) -> u32 {
+    pub fn read_buffer_msb(&self) -> u32 {
         self.info.regs().shiftbufbis(N).read().shiftbufbis()
     }
 
-    /// Raw address of `SHIFTBUF[N]`, for DMA transfers requiring LSB-first output.
+    /// Raw address of `SHIFTBUF[N]` for use in DMA descriptors (LSB-first).
     ///
-    /// For MSB-first output use [`dma_address_bis`](Self::dma_address_bis).
+    /// For MSB-first use [`dma_address_bis`](Self::dma_address_bis).
     #[inline]
     pub fn dma_address(&self) -> *mut u32 {
         self.info.regs().shiftbuf(N).as_ptr() as *mut u32
     }
 
-    /// Raw address of `SHIFTBUFBIS[N]`, for DMA transfers requiring MSB-first output.
+    /// Raw address of `SHIFTBUFBIS[N]` for use in DMA descriptors (MSB-first).
     ///
-    /// Writing to SHIFTBUFBIS reverses bit order so that bit31 of the written value is shifted out first.
+    /// The hardware bit-reverses each 32-bit word written through this address, so
+    /// bit 31 of the written value is shifted out first.
     #[inline]
     pub fn dma_address_bis(&self) -> *mut u32 {
         self.info.regs().shiftbufbis(N).as_ptr() as *mut u32
@@ -532,13 +541,12 @@ impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
         &self.shifter
     }
 
-    /// Single-shot LSB-first write to the shifter (SHIFTBUF).
+    /// Single-shot LSB-first DMA write to the shifter (SHIFTBUF).
     ///
-    /// The DMA beat width matches the word size of `W`: use `u32` for full-word
-    /// transfers, `u16` to write only the low halfword of SHIFTBUF, or `u8` to
-    /// write only the low byte.  Upper bytes of SHIFTBUF that are not written
-    /// retain their previous value but are never clocked if the timer is
-    /// configured for fewer bits than the register width.
+    /// `W` sets the transfer width per DMA beat: `u32` for a full-word write,
+    /// `u16` to write only the low halfword, `u8` for the low byte.  Bytes of
+    /// SHIFTBUF that are not written retain their previous value, which is harmless
+    /// as long as the timer is configured to clock fewer bits than the full 32.
     pub async fn write<W: Word>(&mut self, buf: &[W]) -> Result<(), InvalidParameters> {
         self.shifter.enable_dma();
         let peri_addr = self.shifter.dma_address() as *mut W;
@@ -556,11 +564,11 @@ impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
         r
     }
 
-    /// Single-shot MSB-first write via SHIFTBUFBIS (bit-swapped).
+    /// Single-shot MSB-first DMA write to the shifter (SHIFTBUFBIS).
     ///
-    /// Same word-width semantics as [`write`](Self::write), but targets SHIFTBUFBIS
-    /// so that bit 31 of the written value is shifted out first.
-    pub async fn write_bis<W: Word>(&mut self, buf: &[W]) -> Result<(), InvalidParameters> {
+    /// The most significant bit of each word is shifted out first.  Same
+    /// transfer-width semantics as [`write`](Self::write).
+    pub async fn write_msb<W: Word>(&mut self, buf: &[W]) -> Result<(), InvalidParameters> {
         self.shifter.enable_dma();
         let peri_addr = self.shifter.dma_address_bis() as *mut W;
         let r = unsafe {
@@ -579,9 +587,10 @@ impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
 
     /// Start a continuous LSB-first circular DMA stream (SHIFTBUF).
     ///
-    /// `buf` must be a `&'static mut` slice of even length. The stream fires
-    /// once per half-buffer; use [`ShifterStream::next_half`] and
-    /// [`ShifterStream::fill_idle`] to refill each half.
+    /// `buf` must be a `&'static mut` slice of even length — it is split into two
+    /// halves that the DMA ping-pongs between.  The stream fires once per half;
+    /// use [`ShifterStream::next_half`] and [`ShifterStream::fill_idle`] to refill
+    /// the idle half while the DMA streams the other.
     pub fn start_stream<W: Word>(
         mut self,
         buf: &'static mut [W],
@@ -599,11 +608,11 @@ impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
         Ok(ShifterStream { shifter: self.shifter, transfer: ManuallyDrop::new(transfer) })
     }
 
-    /// Start a continuous MSB-first circular DMA stream via SHIFTBUFBIS.
+    /// Start a continuous MSB-first circular DMA stream (SHIFTBUFBIS).
     ///
-    /// Use this for I2S where bit31 must be shifted out first.  `buf` must be
-    /// a `&'static mut` slice of even length.
-    pub fn start_stream_bis<W: Word>(
+    /// The most significant bit of each word is shifted out first, suitable for
+    /// I2S.  Same buffer constraints as [`start_stream`](Self::start_stream).
+    pub fn start_stream_msb<W: Word>(
         mut self,
         buf: &'static mut [W],
     ) -> Result<ShifterStream<'d, 'ch, N, W>, InvalidParameters> {
@@ -623,7 +632,7 @@ impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
 
 /// An infinite circular DMA stream from memory to a FlexIO shifter.
 ///
-/// Obtained from [`ShifterDma::start_stream`] or [`ShifterDma::start_stream_bis`].
+/// Obtained from [`ShifterDma::start_stream`] or [`ShifterDma::start_stream_msb`].
 ///
 /// Call [`next_half`](Self::next_half) in a loop; it resolves when the hardware
 /// completes one half of the circular buffer and returns `0` (first half done)
