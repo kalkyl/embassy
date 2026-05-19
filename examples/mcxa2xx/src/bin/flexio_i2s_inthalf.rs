@@ -35,11 +35,11 @@
 use embassy_executor::Spawner;
 use hal::clocks::PoweredClock;
 use hal::clocks::periph_helpers::{Div4, FlexioClockSel, FlexioConfig};
-use hal::dma::{Channel, DmaChannel, InvalidParameters, PingPongTransfer, TransferErrors};
+use hal::dma::{Channel, InvalidParameters, TransferErrors};
 use hal::flexio::{
-    Flexio, FlexioPin, Insrc, ShiftctlPincfg, ShiftctlPinpol, Shifter, ShifterConfig, Smod,
-    Sstart, Sstop, TimctlPincfg, TimctlPinpol, Timdec, Timdis, Timena, Timod, TimerConfig,
-    TimerTrigger, Timer as FlexTimer, Timpol, Timout, Timrst, Trgpol, Tstop,
+    Flexio, FlexioPin, Insrc, ShiftctlPincfg, ShiftctlPinpol, Shifter, ShifterConfig, ShifterDma,
+    ShifterStream, Smod, Sstart, Sstop, TimctlPincfg, TimctlPinpol, Timdec, Timdis, Timena,
+    Timod, TimerConfig, TimerTrigger, Timer as FlexTimer, Timpol, Timout, Timrst, Trgpol, Tstop,
 };
 use hal::Peri;
 use hal::peripherals::FLEXIO0;
@@ -82,20 +82,20 @@ static BUF: ConstStaticCell<[u32; HALF_LEN * 2]> = ConstStaticCell::new([0; HALF
 // ---------------------------------------------------------------------------
 
 pub struct FlexioI2sTx<'d> {
-    shifter: Shifter<'d, 0>,
+    sdma: ShifterDma<'d, 'd, 0>,
     #[allow(dead_code)]
     bclk_timer: FlexTimer<'d, 0>,
     #[allow(dead_code)]
     ws_timer: FlexTimer<'d, 1>,
-    dma: DmaChannel<'d>,
 }
 
 /// Active streaming state returned by [`FlexioI2sTx::start_stream`].
 pub struct I2sStream<'d> {
-    _shifter: Shifter<'d, 0>,
+    stream: ShifterStream<'d, 'd, 0>,
+    #[allow(dead_code)]
     _bclk_timer: FlexTimer<'d, 0>,
+    #[allow(dead_code)]
     _ws_timer: FlexTimer<'d, 1>,
-    transfer: PingPongTransfer<'d, u32>,
 }
 
 impl<'d> I2sStream<'d> {
@@ -104,12 +104,12 @@ impl<'d> I2sStream<'d> {
     /// Returns `Ok(0)` when the first half finished, `Ok(1)` when the second
     /// half finished.
     pub async fn next_half(&mut self) -> Result<u8, Error> {
-        self.transfer.next_half().await.map_err(Error::from)
+        self.stream.next_half().await.map_err(Error::from)
     }
 
     /// Refill the half that [`next_half`] just reported idle.
     pub fn fill_idle<F: FnOnce(&mut [u32])>(&mut self, idx: u8, f: F) {
-        self.transfer.fill_idle(idx, f);
+        self.stream.fill_idle(idx, f);
     }
 }
 
@@ -194,13 +194,10 @@ impl<'d> FlexioI2sTx<'d> {
             input_source: Insrc::Pin,
         });
 
-        shifter.enable_dma();
-
         Self {
-            shifter,
+            sdma: shifter.with_dma(dma_ch),
             bclk_timer,
             ws_timer,
-            dma: DmaChannel::new(dma_ch),
         }
     }
 
@@ -213,26 +210,11 @@ impl<'d> FlexioI2sTx<'d> {
         self,
         buf: &'static mut [u32],
     ) -> Result<I2sStream<'d>, Error> {
-        let peri_addr = self.shifter.dma_address_bis();
-        let total_len = buf.len();
-        // SAFETY:
-        // - buf is 'static and consumed here (no live &mut alias remains).
-        // - total_len is even by construction (BUF has size HALF_LEN * 2).
-        // - peri_addr is the FlexIO shifter register, always valid.
-        // - After this call, CPU accesses only via I2sStream::fill_idle.
-        let transfer = unsafe {
-            self.dma.inthalf_write_to_peripheral(
-                buf.as_mut_ptr(),
-                total_len,
-                peri_addr,
-                Shifter::<0>::dma_request(),
-            )
-        }?;
+        let stream = self.sdma.start_stream_bis(buf)?;
         Ok(I2sStream {
-            _shifter: self.shifter,
+            stream,
             _bclk_timer: self.bclk_timer,
             _ws_timer: self.ws_timer,
-            transfer,
         })
     }
 }

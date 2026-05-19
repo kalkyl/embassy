@@ -847,162 +847,33 @@ impl<'d> DmaChannel<'d> {
         }
     }
 
-    /// Start a continuous ping-pong DMA stream from two alternating source
-    /// buffers to a fixed peripheral address, using eDMA scatter-gather.
+    /// Start a continuous circular DMA stream from memory to a peripheral,
+    /// using the eDMA INTHALF + INTMAJOR interrupts — no scatter-gather required.
     ///
-    /// The two TCDs form a circular chain (A → B → A → B → …).  Each TCD has
-    /// `INTMAJOR` set, so the DMA interrupt fires at the end of every buffer.
-    /// [`PingPongTransfer::next_half`] awaits each interrupt and returns `0`
-    /// for buffer A or `1` for buffer B, letting the caller refill the
-    /// just-completed half while hardware already streams the other.
-    ///
-    /// # Arguments
-    ///
-    /// * `pool`      – 32-byte-aligned TCD storage; **must** be `'static`.
-    /// * `buf_a`     – Pointer to the first audio buffer.
-    /// * `buf_b`     – Pointer to the second audio buffer.
-    /// * `len`       – Number of `W` words in **each** buffer (must match).
-    /// * `peri_addr` – Peripheral FIFO / data register address.
-    /// * `request`   – DMA request source that drives the transfers.
-    ///
-    /// # Safety
-    ///
-    /// * `buf_a` and `buf_b` must point to valid, equally-sized regions of
-    ///   `len` `W`-words that remain valid for the life of the transfer.
-    ///   Obtain these via `(&'static mut [W]).as_mut_ptr()` — the `&'static mut`
-    ///   must be consumed (not kept alive) so that no live Rust alias overlaps
-    ///   with the DMA access window.
-    /// * Only write to a buffer inside [`PingPongTransfer::fill_idle`] after
-    ///   [`PingPongTransfer::next_half`] reports it finished.
-    /// * `peri_addr` must be a valid, writable peripheral data register.
-    pub unsafe fn ping_pong_write_to_peripheral<W: Word>(
-        self,
-        pool: &'static mut PingPongPool,
-        buf_a: *mut W,
-        buf_b: *mut W,
-        len: usize,
-        peri_addr: *mut W,
-        request: DmaRequest,
-    ) -> Result<PingPongTransfer<'d, W>, InvalidParameters> {
-        if len == 0 || len > DMA_MAX_TRANSFER_SIZE {
-            return Err(InvalidParameters);
-        }
-
-        let hw_size = W::size().to_hw_size();
-        let soff = W::size().bytes() as i16;
-        // One word per minor loop — the peripheral request signal drives each
-        // minor iteration, so nbytes == one word.
-        let nbytes = W::size().bytes() as u32;
-        let count = len as u16;
-        // Packed ATTR: SSIZE in bits 10:8, DSIZE in bits 2:0.
-        let attr = ((hw_size as u16) << 8) | (hw_size as u16);
-
-        // CSR for both in-memory TCDs:
-        //   Bit 1  INTMAJOR — interrupt on every major-loop completion
-        //   Bit 4  ESG      — scatter-gather: load next TCD on completion
-        //   Bit 3  DREQ=0   — do NOT clear ERQ after completion (keep running)
-        //   Bit 0  START=0  — peripheral ERQ drives the transfer, not SW start
-        const CSR: u16 = 0x0012; // ESG | INTMAJOR
-
-        pool.tcds[0] = Tcd {
-            saddr: buf_a as u32,
-            soff,
-            attr,
-            nbytes,
-            slast: 0, // scatter-gather overwrites SADDR from next TCD
-            daddr: peri_addr as u32,
-            doff: 0,
-            citer: count,
-            dlast_sga: &pool.tcds[1] as *const Tcd as i32,
-            csr: CSR,
-            biter: count,
-        };
-        pool.tcds[1] = Tcd {
-            saddr: buf_b as u32,
-            soff,
-            attr,
-            nbytes,
-            slast: 0,
-            daddr: peri_addr as u32,
-            doff: 0,
-            citer: count,
-            dlast_sga: &pool.tcds[0] as *const Tcd as i32,
-            csr: CSR,
-            biter: count,
-        };
-
-        let t = self.tcd();
-        Self::reset_channel_state(&t);
-        fence(Ordering::Release);
-
-        // Route peripheral request source.
-        unsafe { self.set_request_source(request) };
-
-        // Load TCD A into hardware registers.
-        unsafe { self.load_tcd(&pool.tcds[0]) };
-
-        fence(Ordering::Release);
-
-        // Unpend any stale IRQ that reset_channel_state may have left.
-        cortex_m::peripheral::NVIC::unpend(self.channel.interrupt());
-
-        // Enable hardware request — peripheral DMA flag now drives transfers.
-        t.ch_csr().modify(|w| {
-            w.set_erq(true);
-            w.set_earq(true);
-        });
-
-        Ok(PingPongTransfer::new(self, buf_a, buf_b, len))
-    }
-
-    /// Start a continuous ping-pong DMA stream using a **single** circular buffer
-    /// and the eDMA INTHALF interrupt — no scatter-gather required.
-    ///
-    /// The DMA streams from `buf` (length `total_len`) to `peri_addr`.
-    /// `INTHALF` fires when the source counter reaches the midpoint (first half
-    /// done); `INTMAJOR` fires at the end (second half done).  `SLAST` resets
-    /// the source address after every major loop so the transfer repeats
-    /// automatically.
-    ///
-    /// [`PingPongTransfer::next_half`] awaits each interrupt and returns `0`
-    /// (first half done) or `1` (second half done), giving the CPU one half-
-    /// period to refill via [`PingPongTransfer::fill_idle`].
-    ///
-    /// # Arguments
-    ///
-    /// * `buf`       – Pointer to a buffer of `total_len` `W`-words.
-    /// * `total_len` – Total element count; **must be even** and ≤ `DMA_MAX_TRANSFER_SIZE`.
-    /// * `peri_addr` – Peripheral FIFO / data register address.
-    /// * `request`   – DMA request source.
+    /// `SLAST` resets the source address after every major loop so the transfer
+    /// repeats automatically.  `INTHALF` fires at the midpoint; `INTMAJOR` fires
+    /// at the end.  Use [`CircularTransfer::next_half`] to await each event and
+    /// [`CircularTransfer::fill_idle`] to refill the completed half.
     ///
     /// # Safety
     ///
     /// * `buf` must point to a valid region of `total_len` `W`-words that
-    ///   remains valid for the life of the transfer.  Obtain via
-    ///   `(&'static mut [W]).as_mut_ptr()` — the `&'static mut` must be
-    ///   consumed (not kept alive) so that no live Rust alias overlaps with
-    ///   the DMA access window.
-    /// * Only write to a half inside [`PingPongTransfer::fill_idle`] after
-    ///   [`PingPongTransfer::next_half`] reports it finished.
+    ///   remains valid for the life of the transfer.
+    /// * `total_len` must be even and ≤ `DMA_MAX_TRANSFER_SIZE`.
     /// * `peri_addr` must be a valid writable peripheral data register.
-    pub unsafe fn inthalf_write_to_peripheral<W: Word>(
+    pub(crate) unsafe fn write_to_peripheral_circular<W: Word>(
         self,
         buf: *mut W,
         total_len: usize,
         peri_addr: *mut W,
         request: DmaRequest,
-    ) -> Result<PingPongTransfer<'d, W>, InvalidParameters> {
+    ) -> Result<CircularTransfer<'d, W>, InvalidParameters> {
         if total_len < 2 || total_len > DMA_MAX_TRANSFER_SIZE || total_len % 2 != 0 {
             return Err(InvalidParameters);
         }
 
         let half_len = total_len / 2;
 
-        // Reuse the existing setup_transfers infrastructure:
-        //   circular=true  → DREQ=0 (keep ERQ alive) + SLAST resets SADDR
-        //   half_transfer_interrupt → INTHALF fires at the midpoint
-        //   complete_transfer_interrupt → INTMAJOR fires at end of each pass
-        //   software=false → hardware peripheral ERQ drives the transfer
         unsafe {
             self.setup_transfers(DmaTransferParameters {
                 src_ptr: buf as *const W,
@@ -1031,8 +902,7 @@ impl<'d> DmaChannel<'d> {
             w.set_earq(true);
         });
 
-        // buf_a = first half, buf_b = second half.
-        Ok(PingPongTransfer::new(self, buf, unsafe { buf.add(half_len) }, half_len))
+        Ok(CircularTransfer::new(self, buf, unsafe { buf.add(half_len) }, half_len))
     }
 
     /// Read data from a peripheral register to memory.
@@ -1496,42 +1366,6 @@ struct Tcd {
     pub biter: u16,
 }
 
-/// Storage for the two 32-byte-aligned TCDs required by ping-pong DMA.
-///
-/// Declare one instance as a `static` so the descriptors remain valid for the
-/// entire streaming lifetime.  Use `static_cell::ConstStaticCell` for safe
-/// one-shot initialisation:
-///
-/// ```rust,ignore
-/// use static_cell::ConstStaticCell;
-/// use embassy_mcxa::dma::PingPongPool;
-///
-/// static TCDS: ConstStaticCell<PingPongPool> = ConstStaticCell::new(PingPongPool::new());
-/// ```
-#[repr(C, align(32))]
-pub struct PingPongPool {
-    tcds: [Tcd; 2],
-}
-
-impl PingPongPool {
-    /// Create a zeroed pool.  Suitable for `const` / `static` contexts.
-    pub const fn new() -> Self {
-        const ZERO: Tcd = Tcd {
-            saddr: 0,
-            soff: 0,
-            attr: 0,
-            nbytes: 0,
-            slast: 0,
-            daddr: 0,
-            doff: 0,
-            citer: 0,
-            dlast_sga: 0,
-            csr: 0,
-            biter: 0,
-        };
-        Self { tcds: [ZERO; 2] }
-    }
-}
 
 struct State {
     /// WaitCell for transfer complete interrupt
@@ -1904,76 +1738,30 @@ impl<'a> Drop for Transfer<'a> {
 }
 
 // ============================================================================
-// Ping-Pong Transfer (scatter-gather circular, peripheral TX)
+// Circular Transfer (inthalf circular, peripheral TX)
 // ============================================================================
 
-/// An infinite ping-pong DMA stream to a peripheral, backed by two alternating
-/// buffers.
-///
-/// Obtained from [`DmaChannel::ping_pong_write_to_peripheral`].
-///
-/// Call [`next_half`](Self::next_half) in a loop; it resolves once per completed
-/// buffer and returns `0` when buffer A finished or `1` when buffer B finished.
-/// While the future is pending the hardware is already streaming the *other*
-/// buffer, so the caller has a full buffer period to refill the returned half
-/// before the next `next_half` call.
-///
-/// Dropping the transfer stops the DMA and releases the channel.
-/// An infinite ping-pong DMA stream to a peripheral, backed by two alternating
-/// caller-managed buffers.
-///
-/// # Why raw pointers instead of `&'static mut`
-///
-/// DMA buffers are concurrently read by hardware.  A Rust `&'static mut [W]`
-/// carries `noalias` semantics — the compiler assumes nothing else can touch
-/// that memory while the reference is live.  Handing the pointer to DMA would
-/// violate that assumption even after the reference is gone, because the TCDs
-/// still point into the same allocation.
-///
-/// Instead the caller provides raw `*mut W` pointers obtained from
-/// `UnsafeCell`-wrapped statics, which explicitly opt out of `noalias`.  The
-/// `fill_idle` closure-based API then creates a short-lived `&mut [W]` only
-/// when the DMA is provably on the *other* buffer, so no aliasing conflict
-/// exists during that window.
-///
-/// # Usage
-///
-/// ```rust,ignore
-/// loop {
-///     let idx = stream.next_half().await?;
-///     stream.fill_idle(idx, |buf| { /* write samples into buf */ });
-/// }
-/// ```
-///
-/// `fill_idle` takes `&mut self`, so the borrow checker prevents calling
-/// `next_half` (also `&mut self`) until the closure returns, statically
-/// enforcing the ping-pong ownership protocol.
-pub struct PingPongTransfer<'d, W: Word> {
+pub(crate) struct CircularTransfer<'d, W: Word> {
     channel: DmaChannel<'d>,
-    /// Raw pointers into `UnsafeCell`-backed statics.  Never derived from a
-    /// Rust `&mut` reference, so no `noalias` constraint is asserted.
     buf_a: *mut W,
     buf_b: *mut W,
     len: usize,
-    /// 0 = buf_a just completed; 1 = buf_b just completed.
     half: u8,
     _phantom: PhantomData<W>,
 }
 
-// SAFETY: DmaChannel is Send; the raw pointers are into static storage and
-// access is serialised by the ping-pong protocol.
-unsafe impl<W: Word> Send for PingPongTransfer<'_, W> {}
+// SAFETY: DmaChannel is Send; raw pointers are into static storage and access
+// is serialised by the circular protocol.
+unsafe impl<W: Word> Send for CircularTransfer<'_, W> {}
 
-impl<'d, W: Word> PingPongTransfer<'d, W> {
+impl<'d, W: Word> CircularTransfer<'d, W> {
     fn new(channel: DmaChannel<'d>, buf_a: *mut W, buf_b: *mut W, len: usize) -> Self {
         Self { channel, buf_a, buf_b, len, half: 0, _phantom: PhantomData }
     }
 
-    /// Wait until the next buffer finishes transmitting.
-    ///
-    /// Returns `Ok(0)` when `buf_a` completed, `Ok(1)` when `buf_b` completed.
-    /// Alternates strictly A, B, A, B, …
-    pub async fn next_half(&mut self) -> Result<u8, TransferErrors> {
+    /// Await the next half-buffer completion. Returns `0` (first half done) or
+    /// `1` (second half done), alternating strictly A, B, A, B, …
+    pub(crate) async fn next_half(&mut self) -> Result<u8, TransferErrors> {
         use core::future::poll_fn;
         poll_fn(|cx| {
             let t = self.channel.tcd();
@@ -1981,9 +1769,6 @@ impl<'d, W: Word> PingPongTransfer<'d, W> {
             if es.err() {
                 return Poll::Ready(Err(TransferErrors(es.0 as u8)));
             }
-
-            // poll_wait registers the waker when pending, or consumes a stored
-            // wake (from a completed TCD's INTMAJOR) and returns Ready.
             match STATES[self.channel.index()].waker.poll_wait(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(_) => {
@@ -1997,41 +1782,25 @@ impl<'d, W: Word> PingPongTransfer<'d, W> {
         .await
     }
 
-    /// Call `f` with a mutable slice of the buffer that [`next_half`] just
-    /// reported as idle (the one DMA is no longer reading from).
-    ///
-    /// ```rust,ignore
-    /// let idx = stream.next_half().await?;
-    /// stream.fill_idle(idx, |buf| generate_audio(buf));
-    /// ```
-    ///
-    /// Taking `&mut self` means the borrow checker prevents a concurrent
-    /// `next_half` call; the DMA cannot loop back to this buffer until
-    /// `fill_idle` returns and `next_half` is called again.
-    pub fn fill_idle<F: FnOnce(&mut [W])>(&mut self, idx: u8, f: F) {
-        // SAFETY: `idx` came from `next_half()`.  At that point the DMA has
-        // moved to the *other* TCD.  The raw pointers were obtained from
-        // `UnsafeCell`-backed statics (no `noalias` constraint), and no other
-        // Rust code can hold a live `&[W]` or `&mut [W]` to this memory because
-        // the only access path is through `&mut self` (this method) or the DMA
-        // hardware, and the two are temporally disjoint.
+    /// Call `f` with a mutable slice of the half that `next_half` just reported
+    /// idle.  DMA is provably on the other half for the duration of the closure.
+    pub(crate) fn fill_idle<F: FnOnce(&mut [W])>(&mut self, idx: u8, f: F) {
         let ptr = if idx == 0 { self.buf_a } else { self.buf_b };
+        // SAFETY: idx came from next_half(); DMA is on the other half.
         let slice = unsafe { core::slice::from_raw_parts_mut(ptr, self.len) };
         f(slice);
     }
 }
 
-impl<'d, W: Word> Drop for PingPongTransfer<'d, W> {
+impl<'d, W: Word> Drop for CircularTransfer<'d, W> {
     fn drop(&mut self) {
         let t = self.channel.tcd();
         let irq = self.channel.channel.interrupt();
         critical_section::with(|_| {
-            // Stop accepting new peripheral requests.
             t.ch_csr().modify(|w| {
                 w.set_erq(false);
                 w.set_earq(false);
             });
-            // Disable interrupts and scatter-gather so the channel is inert.
             t.tcd_csr().modify(|w| {
                 w.set_intmajor(false);
                 w.set_inthalf(false);
@@ -2039,7 +1808,6 @@ impl<'d, W: Word> Drop for PingPongTransfer<'d, W> {
             });
             cortex_m::peripheral::NVIC::unpend(irq);
         });
-        // Wait for any in-flight minor loop to drain.
         while t.ch_csr().read().active() {
             core::hint::spin_loop();
         }

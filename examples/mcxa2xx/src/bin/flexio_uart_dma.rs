@@ -16,10 +16,10 @@ use embassy_executor::Spawner;
 use embassy_time::Timer;
 use hal::clocks::PoweredClock;
 use hal::clocks::periph_helpers::{Div4, FlexioClockSel, FlexioConfig};
-use hal::dma::{Channel, DmaChannel, DmaRequest, InvalidParameters, TransferErrors, TransferOptions};
+use hal::dma::{Channel, InvalidParameters, TransferErrors};
 use hal::flexio::{
-    Flexio, FlexioPin, Insrc, ShiftctlPincfg, ShiftctlPinpol, Shifter, ShifterConfig, Smod,
-    Sstart, Sstop, TimctlPincfg, TimctlPinpol, Timdec, Timdis, Timena, Timod, TimerConfig,
+    Flexio, FlexioPin, Insrc, ShiftctlPincfg, ShiftctlPinpol, Shifter, ShifterConfig, ShifterDma,
+    Smod, Sstart, Sstop, TimctlPincfg, TimctlPinpol, Timdec, Timdis, Timena, Timod, TimerConfig,
     TimerTrigger, Timer as FlexTimer, Timpol, Timout, Timrst, Trgpol, Tstop,
 };
 use hal::Peri;
@@ -51,10 +51,9 @@ impl From<TransferErrors> for Error {
 const CHUNK_WORDS: usize = 64;
 
 pub struct FlexioUartTx<'d> {
-    shifter: Shifter<'d, 0>,
+    sdma: ShifterDma<'d, 'd, 0>,
     #[allow(dead_code)]
     timer: FlexTimer<'d, 0>,
-    dma: DmaChannel<'d>,
 }
 
 impl<'d> FlexioUartTx<'d> {
@@ -104,9 +103,8 @@ impl<'d> FlexioUartTx<'d> {
         });
 
         Self {
-            shifter,
+            sdma: shifter.with_dma(dma_ch),
             timer,
-            dma: DmaChannel::new(dma_ch),
         }
     }
 
@@ -129,27 +127,13 @@ impl<'d> FlexioUartTx<'d> {
 
     /// Spin until the last byte has fully shifted out and the line is idle.
     pub fn blocking_flush(&mut self) {
-        while !self.shifter.is_status_set() {
+        while !self.sdma.shifter().is_status_set() {
             core::hint::spin_loop();
         }
     }
 
     async fn write_words_dma(&mut self, words: &[u32]) -> Result<(), Error> {
-        let peri_addr = self.shifter.dma_address();
-        self.shifter.enable_dma();
-
-        let transfer = unsafe {
-            self.dma.write_to_peripheral(
-                words,
-                peri_addr,
-                Shifter::<0>::dma_request(),
-                TransferOptions::COMPLETE_INTERRUPT,
-            )?
-        };
-
-        let result = transfer.await.map_err(Error::from);
-        self.shifter.disable_dma();
-        result
+        self.sdma.write(words).await.map_err(Error::from)
     }
 }
 

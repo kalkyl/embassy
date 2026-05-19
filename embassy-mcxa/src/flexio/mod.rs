@@ -24,7 +24,7 @@ pub use pac::{
 
 use crate::clocks::periph_helpers::FlexioConfig;
 use crate::clocks::{ClockError, Gate, enable_and_reset};
-use crate::dma::DmaRequest;
+use crate::dma::{Channel, CircularTransfer, DmaChannel, DmaRequest, InvalidParameters, TransferErrors, TransferOptions};
 
 pub(crate) struct Info {
     pub(crate) regs: pac::Flexio,
@@ -435,6 +435,13 @@ impl<'d, const N: usize> Shifter<'d, N> {
     pub fn clear_status(&mut self) {
         self.info.regs().shiftstat().write(|w| w.set_ssf(Ssf::from_bits(1 << N)));
     }
+
+    /// Pair this shifter with a DMA channel, enabling DMA-driven transfers.
+    ///
+    /// Accepts a channel peripheral directly (`p.DMA0_CH0` style).
+    pub fn with_dma<'ch, C: Channel>(self, ch: Peri<'ch, C>) -> ShifterDma<'d, 'ch, N> {
+        ShifterDma { shifter: self, dma: DmaChannel::new(ch) }
+    }
 }
 
 /// Exclusive handle for FlexIO Timer `N`.
@@ -507,6 +514,154 @@ impl<'d, const N: usize> Timer<'d, N> {
     #[inline]
     pub fn clear_status(&mut self) {
         self.info.regs().timstat().write(|w| w.set_tsf(Tsf::from_bits(1 << N)));
+    }
+}
+
+// ============================================================================
+// ShifterDma — Shifter paired with a DMA channel
+// ============================================================================
+
+/// A [`Shifter`] paired with a DMA channel for DMA-driven transfers.
+///
+/// Obtained via [`Shifter::with_dma`].
+pub struct ShifterDma<'d, 'ch, const N: usize> {
+    shifter: Shifter<'d, N>,
+    dma: DmaChannel<'ch>,
+}
+
+impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
+    /// Borrow the inner [`Shifter`] for direct register access (e.g. status polling).
+    pub fn shifter(&self) -> &Shifter<'d, N> {
+        &self.shifter
+    }
+
+    /// Single-shot LSB-first write to the shifter (SHIFTBUF).
+    ///
+    /// Suitable for UART-style protocols where bit0 is shifted out first.
+    pub async fn write(&mut self, buf: &[u32]) -> Result<(), InvalidParameters> {
+        self.shifter.enable_dma();
+        let r = unsafe {
+            self.dma.write_to_peripheral(
+                buf,
+                self.shifter.dma_address(),
+                Shifter::<N>::dma_request(),
+                TransferOptions::COMPLETE_INTERRUPT,
+            )
+        }?
+        .await
+        .map_err(|_| InvalidParameters);
+        self.shifter.disable_dma();
+        r
+    }
+
+    /// Single-shot MSB-first write via SHIFTBUFBIS (bit-swapped).
+    ///
+    /// Suitable for I2S-style protocols where bit31 is shifted out first.
+    pub async fn write_bis(&mut self, buf: &[u32]) -> Result<(), InvalidParameters> {
+        self.shifter.enable_dma();
+        let r = unsafe {
+            self.dma.write_to_peripheral(
+                buf,
+                self.shifter.dma_address_bis(),
+                Shifter::<N>::dma_request(),
+                TransferOptions::COMPLETE_INTERRUPT,
+            )
+        }?
+        .await
+        .map_err(|_| InvalidParameters);
+        self.shifter.disable_dma();
+        r
+    }
+
+    /// Start a continuous LSB-first circular DMA stream (SHIFTBUF).
+    ///
+    /// `buf` must be a `&'static mut` slice of even length. The stream fires
+    /// once per half-buffer; use [`ShifterStream::next_half`] and
+    /// [`ShifterStream::fill_idle`] to refill each half.
+    pub fn start_stream(
+        mut self,
+        buf: &'static mut [u32],
+    ) -> Result<ShifterStream<'d, 'ch, N>, InvalidParameters> {
+        let peri_addr = self.shifter.dma_address();
+        self.shifter.enable_dma();
+        let transfer = unsafe {
+            self.dma.write_to_peripheral_circular(
+                buf.as_mut_ptr(),
+                buf.len(),
+                peri_addr,
+                Shifter::<N>::dma_request(),
+            )
+        }?;
+        Ok(ShifterStream { shifter: self.shifter, transfer: core::mem::ManuallyDrop::new(transfer) })
+    }
+
+    /// Start a continuous MSB-first circular DMA stream via SHIFTBUFBIS.
+    ///
+    /// Use this for I2S where bit31 must be shifted out first.  `buf` must be
+    /// a `&'static mut` slice of even length.
+    pub fn start_stream_bis(
+        mut self,
+        buf: &'static mut [u32],
+    ) -> Result<ShifterStream<'d, 'ch, N>, InvalidParameters> {
+        let peri_addr = self.shifter.dma_address_bis();
+        self.shifter.enable_dma();
+        let transfer = unsafe {
+            self.dma.write_to_peripheral_circular(
+                buf.as_mut_ptr(),
+                buf.len(),
+                peri_addr,
+                Shifter::<N>::dma_request(),
+            )
+        }?;
+        Ok(ShifterStream { shifter: self.shifter, transfer: core::mem::ManuallyDrop::new(transfer) })
+    }
+}
+
+// ============================================================================
+// ShifterStream — running circular DMA stream tied to a shifter
+// ============================================================================
+
+/// An infinite circular DMA stream from memory to a FlexIO shifter.
+///
+/// Obtained from [`ShifterDma::start_stream`] or [`ShifterDma::start_stream_bis`].
+///
+/// Call [`next_half`](Self::next_half) in a loop; it resolves when the hardware
+/// completes one half of the circular buffer and returns `0` (first half done)
+/// or `1` (second half done).  While awaiting, the DMA is already streaming the
+/// other half, giving the CPU a full half-period to refill via
+/// [`fill_idle`](Self::fill_idle).
+///
+/// Dropping the stream stops the DMA and clears the shifter's DMA-request enable.
+pub struct ShifterStream<'d, 'ch, const N: usize> {
+    shifter: Shifter<'d, N>,
+    transfer: core::mem::ManuallyDrop<CircularTransfer<'ch, u32>>,
+}
+
+// SAFETY: CircularTransfer is Send; Shifter is Send.
+unsafe impl<'d, 'ch, const N: usize> Send for ShifterStream<'d, 'ch, N> {}
+
+impl<'d, 'ch, const N: usize> ShifterStream<'d, 'ch, N> {
+    /// Await the next half-buffer completion.
+    ///
+    /// Returns `Ok(0)` when the first half finished, `Ok(1)` when the second
+    /// half finished.  Alternates strictly 0, 1, 0, 1, …
+    pub async fn next_half(&mut self) -> Result<u8, TransferErrors> {
+        self.transfer.next_half().await
+    }
+
+    /// Call `f` with a mutable slice of the half that [`next_half`] just
+    /// reported idle.  The DMA is provably on the other half for the duration.
+    pub fn fill_idle<F: FnOnce(&mut [u32])>(&mut self, idx: u8, f: F) {
+        self.transfer.fill_idle(idx, f);
+    }
+}
+
+impl<'d, 'ch, const N: usize> Drop for ShifterStream<'d, 'ch, N> {
+    fn drop(&mut self) {
+        // Drop CircularTransfer first: disables ERQ, interrupts, drains active loop.
+        unsafe { core::mem::ManuallyDrop::drop(&mut self.transfer) };
+        // Then clear the shifter's DMA-request enable (SHIFTSDEN bit).
+        self.shifter.disable_dma();
     }
 }
 
