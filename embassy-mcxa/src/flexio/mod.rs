@@ -26,17 +26,9 @@ use crate::clocks::periph_helpers::FlexioConfig;
 use crate::clocks::{ClockError, Gate, enable_and_reset};
 use crate::dma::DmaRequest;
 
-// ---------------------------------------------------------------------------
-// Sealed instance
-// ---------------------------------------------------------------------------
-
-mod sealed {
-    pub trait Sealed {}
-}
-
 pub(crate) struct Info {
-    pub regs: pac::Flexio,
-    pub mrcc_disable: unsafe fn(),
+    pub(crate) regs: pac::Flexio,
+    pub(crate) mrcc_disable: unsafe fn(),
 }
 
 unsafe impl Sync for Info {}
@@ -81,8 +73,6 @@ macro_rules! impl_flexio_instance {
             }
 
             impl crate::flexio::Instance for crate::peripherals::[<FLEXIO $n>] {
-                // MCXA FlexIO0 has 4 shifters and 4 timers (read from PARAM at runtime).
-                // These constants can be overridden per-instance when more are present.
                 const SHIFTER_COUNT: usize = 4;
                 const TIMER_COUNT: usize = 4;
             }
@@ -90,14 +80,8 @@ macro_rules! impl_flexio_instance {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Gate implementation (not yet in metadata, so we call impl_cc_gate! here)
-// ---------------------------------------------------------------------------
-//
-// These will eventually be auto-generated once nxp-pac metadata exposes `gate`
-// for FLEXIO0.  Until then we wire it up manually.
-
-#[cfg(feature = "mcxa5xx")]
+// Gate not yet in nxp-pac metadata; wired manually until then.
+#[cfg(any(feature = "mcxa2xx", feature = "mcxa5xx"))]
 crate::impl_cc_gate!(
     FLEXIO0,
     mrcc_glb_cc0,
@@ -105,19 +89,6 @@ crate::impl_cc_gate!(
     flexio0,
     FlexioConfig
 );
-
-#[cfg(feature = "mcxa2xx")]
-crate::impl_cc_gate!(
-    FLEXIO0,
-    mrcc_glb_cc0,
-    mrcc_glb_rst0,
-    flexio0,
-    FlexioConfig
-);
-
-// ---------------------------------------------------------------------------
-// HAL-level configuration types
-// ---------------------------------------------------------------------------
 
 /// Configuration passed to [`Shifter::set_config`].
 #[derive(Copy, Clone, Debug)]
@@ -169,7 +140,7 @@ pub enum TimerTrigger {
     InternalLane { lane: u8, polarity: Trgpol },
     /// Internal trigger from shifter `n` status flag.
     InternalShifterFlag { shifter: u8, polarity: Trgpol },
-    /// External trigger (TRGSRC = 0), raw `trgsel` value.
+    /// External trigger; raw `trgsel` value.
     External { trgsel: u8, polarity: Trgpol },
 }
 
@@ -225,10 +196,6 @@ impl Default for TimerConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Peripheral manager
-// ---------------------------------------------------------------------------
-
 /// FlexIO peripheral manager.
 ///
 /// Created with [`Flexio::new`].  Call [`Flexio::split`] to obtain independent
@@ -249,7 +216,6 @@ impl<'d, INST: Instance> Flexio<'d, INST> {
         regs.ctrl().write(|w| w.set_swrst(true));
         regs.ctrl().write(|w| w.set_swrst(false));
 
-        // Enable the FlexIO block.
         regs.ctrl().modify(|w| w.set_flexen(true));
 
         Ok(Self {
@@ -284,15 +250,10 @@ impl<'d, INST: Instance> Flexio<'d, INST> {
 
 impl<INST: Instance> Drop for Flexio<'_, INST> {
     fn drop(&mut self) {
-        // Disable FlexIO and gate the clock.
         self.info.regs().ctrl().modify(|w| w.set_flexen(false));
         unsafe { (self.info.mrcc_disable)() };
     }
 }
-
-// ---------------------------------------------------------------------------
-// ShifterCluster
-// ---------------------------------------------------------------------------
 
 /// Handle to the set of Shifters in a FlexIO instance.
 ///
@@ -325,10 +286,6 @@ impl<'d> ShifterCluster<'d> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// TimerCluster
-// ---------------------------------------------------------------------------
-
 /// Handle to the set of Timers in a FlexIO instance.
 ///
 /// Obtained from [`Flexio::split`].  Use [`TimerCluster::take`] to obtain
@@ -359,10 +316,6 @@ impl<'d> TimerCluster<'d> {
         })
     }
 }
-
-// ---------------------------------------------------------------------------
-// Shifter handle
-// ---------------------------------------------------------------------------
 
 /// Exclusive handle for FlexIO Shifter `N`.
 ///
@@ -488,10 +441,6 @@ impl<'d, const N: usize> Shifter<'d, N> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Timer handle
-// ---------------------------------------------------------------------------
-
 /// Exclusive handle for FlexIO Timer `N`.
 ///
 /// Obtained via [`TimerCluster::take`].
@@ -525,7 +474,6 @@ impl<'d, const N: usize> Timer<'d, N> {
             w.set_tstart(cfg.tstart);
         });
 
-        // Resolve trigger fields from the high-level enum.
         let (trgsrc, trgpol, trgsel) = match cfg.trigger {
             TimerTrigger::None => (Trgsrc::ExtTrig, Trgpol::ActiveHigh, 0u8),
             TimerTrigger::InternalLane { lane, polarity } => {
@@ -566,10 +514,6 @@ impl<'d, const N: usize> Timer<'d, N> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pin-mapping trait
-// ---------------------------------------------------------------------------
-
 /// Marker trait linking a physical pad to a FlexIO internal lane.
 ///
 /// `INST` is the peripheral type (e.g. `FLEXIO0`).
@@ -586,7 +530,6 @@ pub trait FlexioPin<INST: Instance, const LANE: usize>:
 
     /// Configure the pad for FlexIO use (set MUX, pull, and input buffer).
     fn as_flexio_lane(&self) {
-        use crate::gpio::SealedPin;
         self.set_pull(crate::gpio::Pull::Disabled);
         self.set_function(Self::MUX);
         self.set_enable_input_buffer(true);
