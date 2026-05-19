@@ -582,11 +582,11 @@ impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
     /// `buf` must be a `&'static mut` slice of even length. The stream fires
     /// once per half-buffer; use [`ShifterStream::next_half`] and
     /// [`ShifterStream::fill_idle`] to refill each half.
-    pub fn start_stream(
+    pub fn start_stream<W: Word>(
         mut self,
-        buf: &'static mut [u32],
-    ) -> Result<ShifterStream<'d, 'ch, N>, InvalidParameters> {
-        let peri_addr = self.shifter.dma_address();
+        buf: &'static mut [W],
+    ) -> Result<ShifterStream<'d, 'ch, N, W>, InvalidParameters> {
+        let peri_addr = self.shifter.dma_address() as *mut W;
         self.shifter.enable_dma();
         let transfer = unsafe {
             self.dma.write_to_peripheral_circular(
@@ -603,11 +603,11 @@ impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
     ///
     /// Use this for I2S where bit31 must be shifted out first.  `buf` must be
     /// a `&'static mut` slice of even length.
-    pub fn start_stream_bis(
+    pub fn start_stream_bis<W: Word>(
         mut self,
-        buf: &'static mut [u32],
-    ) -> Result<ShifterStream<'d, 'ch, N>, InvalidParameters> {
-        let peri_addr = self.shifter.dma_address_bis();
+        buf: &'static mut [W],
+    ) -> Result<ShifterStream<'d, 'ch, N, W>, InvalidParameters> {
+        let peri_addr = self.shifter.dma_address_bis() as *mut W;
         self.shifter.enable_dma();
         let transfer = unsafe {
             self.dma.write_to_peripheral_circular(
@@ -632,15 +632,15 @@ impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
 /// [`fill_idle`](Self::fill_idle).
 ///
 /// Dropping the stream stops the DMA and clears the shifter's DMA-request enable.
-pub struct ShifterStream<'d, 'ch, const N: usize> {
+pub struct ShifterStream<'d, 'ch, const N: usize, W: Word = u32> {
     shifter: Shifter<'d, N>,
-    transfer: ManuallyDrop<CircularTransfer<'ch, u32>>,
+    transfer: ManuallyDrop<CircularTransfer<'ch, W>>,
 }
 
 // SAFETY: CircularTransfer is Send; Shifter is Send.
-unsafe impl<'d, 'ch, const N: usize> Send for ShifterStream<'d, 'ch, N> {}
+unsafe impl<'d, 'ch, const N: usize, W: Word + Send> Send for ShifterStream<'d, 'ch, N, W> {}
 
-impl<'d, 'ch, const N: usize> ShifterStream<'d, 'ch, N> {
+impl<'d, 'ch, const N: usize, W: Word> ShifterStream<'d, 'ch, N, W> {
     /// Await the next half-buffer completion.
     ///
     /// Returns `Ok(0)` when the first half finished, `Ok(1)` when the second
@@ -651,12 +651,12 @@ impl<'d, 'ch, const N: usize> ShifterStream<'d, 'ch, N> {
 
     /// Call `f` with a mutable slice of the half that [`next_half`] just
     /// reported idle.  The DMA is provably on the other half for the duration.
-    pub fn fill_idle<F: FnOnce(&mut [u32])>(&mut self, idx: u8, f: F) {
+    pub fn fill_idle<F: FnOnce(&mut [W])>(&mut self, idx: u8, f: F) {
         self.transfer.fill_idle(idx, f);
     }
 }
 
-impl<'d, 'ch, const N: usize> Drop for ShifterStream<'d, 'ch, N> {
+impl<'d, 'ch, const N: usize, W: Word> Drop for ShifterStream<'d, 'ch, N, W> {
     fn drop(&mut self) {
         // Drop CircularTransfer first: disables ERQ, interrupts, drains active loop.
         unsafe { ManuallyDrop::drop(&mut self.transfer) };
