@@ -68,8 +68,9 @@ impl<'d> FlexioUartTx<'d> {
         tx_pin.as_flexio_lane();
         let lane = L as u8;
 
-        let baud_div = (flexio_clk / (4 * baud)) as u16;
-        let compare: u16 = (0x15u16 << 8) | (baud_div.saturating_sub(1) & 0xFF);
+        let baud_div = (flexio_clk / (2 * baud)) as u16;
+        // upper byte = (10 bits × 2) − 1: upper counter decrements every half-period
+        let compare: u16 = (0x13u16 << 8) | (baud_div.saturating_sub(1) & 0xFF);
 
         timer.set_config(&TimerConfig {
             timod: Timod::Dual8bitBaud,
@@ -116,7 +117,7 @@ impl<'d> FlexioUartTx<'d> {
 
             let mut buf = [0u32; CHUNK_WORDS];
             for (i, &byte) in chunk.iter().enumerate() {
-                buf[i] = (byte as u32) | 0xFFFF_FF00;
+                buf[i] = ((byte as u32) << 1) | 0xFFFF_FE00;
             }
 
             self.write_words_dma(&buf[..chunk.len()]).await?;
@@ -146,10 +147,11 @@ async fn main(_spawner: Spawner) {
 
     defmt::info!("FlexIO UART DMA Tx example");
 
+    // FRO_HF defaults to 45 MHz on MCXA2xx; 45 / 3 = 15 MHz.
     let flexio_cfg = FlexioConfig {
         power: PoweredClock::NormalEnabledDeepSleepDisabled,
         source: FlexioClockSel::FroHfGated,
-        div: Div4::from_divisor(4).unwrap(),
+        div: Div4::from_divisor(3).unwrap(),
     };
 
     let flexio = Flexio::new(p.FLEXIO0, flexio_cfg).expect("FlexIO init failed");
@@ -161,7 +163,7 @@ async fn main(_spawner: Spawner) {
         p.P3_28,
         p.DMA0_CH0,
         115_200,
-        24_000_000,
+        15_000_000,
     );
 
     let mut counter: u32 = 0;

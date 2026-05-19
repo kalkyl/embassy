@@ -197,6 +197,7 @@ async fn main(_spawner: Spawner) {
 
     defmt::info!("FlexIO I2S TX DMA example");
 
+    // FRO_HF defaults to 45 MHz on MCXA2xx; 45 / 3 = 15 MHz.
     let flexio_cfg = FlexioConfig {
         power: PoweredClock::NormalEnabledDeepSleepDisabled,
         source: FlexioClockSel::FroHfGated,

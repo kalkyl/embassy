@@ -34,57 +34,57 @@ pub struct FlexioUartTx<'d> {
 }
 
 impl<'d> FlexioUartTx<'d> {
-    pub fn new<P: FlexioPin<FLEXIO0, L>, const L: usize>(
-        mut shifter: Shifter<'d, 0>,
-        mut timer: FlexTimer<'d, 0>,
-        tx_pin: Peri<'d, P>,
-        baud: u32,
-        flexio_clk: u32,
-    ) -> Self {
-        tx_pin.as_flexio_lane();
+pub fn new<P: FlexioPin<FLEXIO0, L>, const L: usize>(
+    mut shifter: Shifter<'d, 0>,
+    mut timer: FlexTimer<'d, 0>,
+    tx_pin: Peri<'d, P>,
+    baud: u32,
+    flexio_clk: u32,
+) -> Self {
+    tx_pin.as_flexio_lane();
+    let lane = L as u8;
 
-        let lane = L as u8;
+    let baud_div = (flexio_clk / (2 * baud)) as u16;
+    // upper byte = (10 bits × 2) − 1: upper counter decrements every half-period
+    let compare: u16 = (0x13u16 << 8) | (baud_div.saturating_sub(1) & 0xFF);
 
-        let baud_div = (flexio_clk / (4 * baud)) as u16;
-        let compare: u16 = (0x15u16 << 8) | (baud_div.saturating_sub(1) & 0xFF);
+    timer.set_config(&TimerConfig {
+        timod: Timod::Dual8bitBaud,
+        timdec: Timdec::FlexioClkShiftclkTmrOut,
+        timena: Timena::TmrTrighiEn, // Start when data is written to shifter
+        timdis: Timdis::TmrCmp,      // Stop when timer expires (bits sent)
+        timrst: Timrst::Never,
+        timout: Timout::One,
+        tstop: Tstop::EnableTmrdisable,
+        tstart: true,
+        pin_select: lane,
+        pin_cfg: TimctlPincfg::Outdisable,
+        pin_pol: TimctlPinpol::ActiveHigh,
+        trigger: TimerTrigger::InternalShifterFlag {
+            shifter: 0,
+            polarity: Trgpol::ActiveLow,
+        },
+        compare,
+    });
 
-        timer.set_config(&TimerConfig {
-            timod: Timod::Dual8bitBaud,
-            timdec: Timdec::FlexioClkShiftclkTmrOut,
-            timena: Timena::TmrTrighiEn,
-            timdis: Timdis::TmrCmp,
-            timrst: Timrst::Never,
-            timout: Timout::One,
-            tstop: Tstop::EnableTmrdisable,
-            tstart: true,
-            pin_select: lane,
-            pin_cfg: TimctlPincfg::Outdisable,
-            pin_pol: TimctlPinpol::ActiveHigh,
-            trigger: TimerTrigger::InternalShifterFlag {
-                shifter: 0,
-                polarity: Trgpol::ActiveLow,
-            },
-            compare,
-        });
+    shifter.set_config(&ShifterConfig {
+        smod: Smod::Transmit,
+        pin_select: lane,
+        pin_cfg: ShiftctlPincfg::Output,
+        pin_pol: ShiftctlPinpol::ActiveHigh,
+        timer_pol: Timpol::Negedge,
+        timer_select: 0,
+        start_bit: Sstart::Value10, // Logic 0 for Start bit
+        stop_bit: Sstop::Value11,  // Logic 1 for Stop bit
+        input_source: Insrc::Pin,
+    });
 
-        shifter.set_config(&ShifterConfig {
-            smod: Smod::Transmit,
-            pin_select: lane,
-            pin_cfg: ShiftctlPincfg::Output,
-            pin_pol: ShiftctlPinpol::ActiveHigh,
-            timer_pol: Timpol::Negedge,
-            timer_select: 0,
-            start_bit: Sstart::Value10,
-            stop_bit: Sstop::Value11,
-            input_source: Insrc::Pin,
-        });
-
-        Self { shifter, timer }
-    }
+    Self { shifter, timer }
+}
 
     pub fn write_byte(&mut self, byte: u8) {
         while !self.shifter.is_status_set() {}
-        let word = (byte as u32) | 0xFFFFFF00;
+        let word = ((byte as u32) << 1) | 0xFFFFFE00;
         self.shifter.write_buffer(word);
     }
 
@@ -104,11 +104,12 @@ async fn main(_spawner: Spawner) {
 
     defmt::info!("FlexIO UART Tx example");
 
-    let flexio_clk_hz = 24_000_000u32;
+    // FRO_HF defaults to 45 MHz on MCXA2xx; 45 / 3 = 15 MHz.
+    let flexio_clk_hz = 15_000_000u32;
     let flexio_cfg = FlexioConfig {
         power: PoweredClock::NormalEnabledDeepSleepDisabled,
         source: FlexioClockSel::FroHfGated,
-        div: Div4::from_divisor(4).unwrap(),
+        div: Div4::from_divisor(3).unwrap(),
     };
     let flexio = Flexio::new(p.FLEXIO0, flexio_cfg).expect("FlexIO init failed");
     let (mut shifters, mut timers) = flexio.split();
@@ -119,7 +120,7 @@ async fn main(_spawner: Spawner) {
     let mut uart = FlexioUartTx::new(shifter0, timer0, p.P3_28, 115_200, flexio_clk_hz);
 
     loop {
-        uart.write(b"hello world");
+        uart.write(b"hello world\r\n");
         Timer::after_millis(1000).await;
     }
 }
