@@ -166,30 +166,9 @@ async fn main(_spawner: Spawner) {
         flexio_clk_hz,
     );
 
-    let mut counter: u32 = 0;
     loop {
-        uart.write(b"Hello from FlexIO UART DMA! count=").await.unwrap();
-        let mut buf = [0u8; 10];
-        uart.write(fmt_u32(counter, &mut buf)).await.unwrap();
-        uart.write(b"\r\n").await.unwrap();
+        uart.write(b"hello world\r\n").await.unwrap();
         uart.blocking_flush();
-
-        defmt::info!("Sent line {}", counter);
-        counter = counter.wrapping_add(1);
         Timer::after_millis(1000).await;
     }
-}
-
-fn fmt_u32(mut n: u32, buf: &mut [u8; 10]) -> &[u8] {
-    if n == 0 {
-        buf[9] = b'0';
-        return &buf[9..];
-    }
-    let mut i = 10usize;
-    while n > 0 {
-        i -= 1;
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    &buf[i..]
 }
