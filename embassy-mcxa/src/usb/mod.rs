@@ -21,7 +21,7 @@ use crate::interrupt;
 use crate::interrupt::typelevel::{Binding, Handler, Interrupt};
 use crate::peripherals::USB0;
 
-pub(crate) mod pac;
+use crate::pac::usb as pac;
 
 const EP_COUNT: usize = 8;
 const HW_EP_COUNT: usize = 16;
@@ -309,20 +309,20 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
 
         let usb = usb();
 
-        usb.usbtrc0().write_value(pac::regs::Usbtrc0(0x80));
+        usb.usbtrc0().write_value(pac::Usbtrc0(0x80));
         for _ in 0..200_000u32 {
             core::hint::spin_loop();
         }
 
-        usb.ctl().write_value(pac::regs::Ctl(0));
-        usb.ctl().write(|w| w.set_usbensofen(pac::vals::Usbensofen::EN_USB_SOF));
+        usb.ctl().write_value(pac::Ctl(0));
+        usb.ctl().write(|w| w.set_usbensofen(pac::Usbensofen::EnUsbSof));
 
         usb.clk_recover_irc_en()
-            .write(|w| w.set_irc_en(pac::vals::IrcEn::EN_IRC));
+            .write(|w| w.set_irc_en(pac::IrcEn::EnIrc));
         usb.clk_recover_ctrl().write(|w| {
-            w.set_clock_recover_en(pac::vals::ClockRecoverEn::EN_CLK_RECOVER);
-            w.set_reset_resume_rough_en(pac::vals::ResetResumeRoughEn::KEEP_TRIM_FINE_ON_RESET);
-            w.set_restart_ifrtrim_en(pac::vals::RestartIfrtrimEn::LOAD_TRIM_FINE_IFR);
+            w.set_clock_recover_en(pac::ClockRecoverEn::EnClkRecover);
+            w.set_reset_resume_rough_en(pac::ResetResumeRoughEn::KeepTrimFineOnReset);
+            w.set_restart_ifrtrim_en(pac::RestartIfrtrimEn::LoadTrimFineIfr);
         });
 
         reset_state();
@@ -331,17 +331,17 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
 
         let bdt_addr = BDT.get() as u32;
         usb.bdtpage1()
-            .write_value(pac::regs::Bdtpage1(((bdt_addr >> 8) as u8) & 0xfe));
-        usb.bdtpage2().write_value(pac::regs::Bdtpage2((bdt_addr >> 16) as u8));
-        usb.bdtpage3().write_value(pac::regs::Bdtpage3((bdt_addr >> 24) as u8));
+            .write_value(pac::Bdtpage1(((bdt_addr >> 8) as u8) & 0xfe));
+        usb.bdtpage2().write_value(pac::Bdtpage2((bdt_addr >> 16) as u8));
+        usb.bdtpage3().write_value(pac::Bdtpage3((bdt_addr >> 24) as u8));
 
-        usb.usbctrl().write_value(pac::regs::Usbctrl(0x00));
+        usb.usbctrl().write_value(pac::Usbctrl(0x00));
 
-        usb.istat().write_value(pac::regs::Istat(0xff));
-        usb.errstat().write_value(pac::regs::Errstat(0xff));
-        usb.erren().write_value(pac::regs::Erren(0xff));
-        usb.inten().write_value(pac::regs::Inten(0xbb));
-        usb.clk_recover_int_en().write_value(pac::regs::ClkRecoverIntEn(0x00));
+        usb.istat().write_value(pac::Istat(0xff));
+        usb.errstat().write_value(pac::Errstat(0xff));
+        usb.erren().write_value(pac::Erren(0xff));
+        usb.inten().write_value(pac::Inten(0xbb));
+        usb.clk_recover_int_en().write_value(pac::ClkRecoverIntEn(0x00));
         clear_clock_recovery_interrupt();
 
         usb.ctl().modify(|w| w.set_oddrst(true));
@@ -351,7 +351,7 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
         endpoint_write(0, ENDPT_EPHSHK | ENDPT_EPRXEN | ENDPT_EPTXEN);
 
         usb.control()
-            .write(|w| w.set_dppullupnonotg(pac::vals::Dppullupnonotg::EN_DEVICE_DP_PU));
+            .write(|w| w.set_dppullupnonotg(pac::Dppullupnonotg::EnDeviceDpPu));
 
         interrupt::typelevel::USB0::unpend();
         // SAFETY: The interrupt handler is bound by `Driver::new`, and USB0 is
@@ -685,9 +685,7 @@ impl embassy_usb_driver::EndpointIn for EndpointIn<'_> {
 }
 
 fn usb() -> pac::Usb {
-    // SAFETY: `USB0_BASE` comes from the same nxp-pac metadata as this local
-    // register shim. Access is serialized by the driver and USB0 interrupt.
-    unsafe { pac::Usb::from_ptr(pac::USB0_BASE as *mut ()) }
+    crate::pac::USB0
 }
 
 fn configure_usb_clock() {
@@ -774,7 +772,7 @@ fn endpoint_read(ep: usize) -> u8 {
 }
 
 fn endpoint_write(ep: usize, bits: u8) {
-    usb().endpoint(ep).endpt().write_value(pac::regs::Endpt(bits));
+    usb().endpoint(ep).endpt().write_value(pac::Endpt(bits));
 }
 
 fn bd_index(ep: usize, is_in: bool, odd: bool) -> usize {
@@ -929,9 +927,9 @@ fn resume_ep0_token_processing() {
 fn clear_clock_recovery_interrupt() {
     // USBTRC0[4] can fire USB0 without a corresponding ISTAT bit.
     let usb = usb();
-    usb.usbtrc0().write_value(pac::regs::Usbtrc0(0x10));
+    usb.usbtrc0().write_value(pac::Usbtrc0(0x10));
     usb.clk_recover_int_status()
-        .write_value(pac::regs::ClkRecoverIntStatus(0x10));
+        .write_value(pac::ClkRecoverIntStatus(0x10));
 }
 
 fn prime_ep0_out_setup() {
@@ -1010,7 +1008,7 @@ fn on_interrupt() {
             endpoint_write(ep, 0);
         }
 
-        usb.addr().write_value(pac::regs::Addr(0));
+        usb.addr().write_value(pac::Addr(0));
         reset_state();
         clear_bdt();
         usb.ctl().modify(|w| w.set_oddrst(true));
@@ -1020,25 +1018,25 @@ fn on_interrupt() {
 
         STATE.events.fetch_or(EVENT_RESET, Ordering::Release);
         STATE.bus_waker.wake();
-        usb.istat().write_value(pac::regs::Istat(ISTAT_USBRST));
+        usb.istat().write_value(pac::Istat(ISTAT_USBRST));
     }
 
     if istat & ISTAT_SLEEP != 0 {
         STATE.events.fetch_or(EVENT_SUSPEND, Ordering::Release);
         STATE.bus_waker.wake();
-        usb.istat().write_value(pac::regs::Istat(ISTAT_SLEEP));
+        usb.istat().write_value(pac::Istat(ISTAT_SLEEP));
     }
 
     if istat & ISTAT_RESUME != 0 {
         STATE.events.fetch_or(EVENT_RESUME, Ordering::Release);
         STATE.bus_waker.wake();
-        usb.istat().write_value(pac::regs::Istat(ISTAT_RESUME));
+        usb.istat().write_value(pac::Istat(ISTAT_RESUME));
     }
 
     if istat & ISTAT_TOKDNE != 0 {
         let stat = usb.stat().read();
         let ep_num = stat.endp() as usize;
-        let is_tx = stat.tx() == pac::vals::Tx::TX_TRANSACTION;
+        let is_tx = stat.tx() == pac::Tx::TxTransaction;
         let odd = stat.odd().to_bits() as usize;
         let bd_idx = bd_index(ep_num, is_tx, odd != 0);
         let ctrl = bd_ctrl(bd_idx);
@@ -1070,7 +1068,7 @@ fn on_interrupt() {
                 if ep_num == 0 && token_pid == TOKEN_IN {
                     let pa = STATE.pending_addr.load(Ordering::Acquire);
                     if pa & 0x80 != 0 {
-                        usb.addr().write_value(pac::regs::Addr(pa & 0x7f));
+                        usb.addr().write_value(pac::Addr(pa & 0x7f));
                         STATE.pending_addr.store(0, Ordering::Release);
                     }
                 }
@@ -1078,17 +1076,17 @@ fn on_interrupt() {
             }
         }
 
-        usb.istat().write_value(pac::regs::Istat(ISTAT_TOKDNE));
+        usb.istat().write_value(pac::Istat(ISTAT_TOKDNE));
     }
 
     if istat & ISTAT_STALL != 0 {
         endpoint_write(0, endpoint_read(0) & !ENDPT_EPSTALL);
         prime_ep0_out_setup();
-        usb.istat().write_value(pac::regs::Istat(ISTAT_STALL));
+        usb.istat().write_value(pac::Istat(ISTAT_STALL));
     }
 
     if istat & ISTAT_ERROR != 0 {
-        usb.errstat().write_value(pac::regs::Errstat(0xff));
-        usb.istat().write_value(pac::regs::Istat(ISTAT_ERROR));
+        usb.errstat().write_value(pac::Errstat(0xff));
+        usb.istat().write_value(pac::Istat(ISTAT_ERROR));
     }
 }
