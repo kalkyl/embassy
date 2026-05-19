@@ -25,7 +25,7 @@ pub use pac::{
 
 use crate::clocks::periph_helpers::FlexioConfig;
 use crate::clocks::{ClockError, Gate, enable_and_reset};
-use crate::dma::{Channel, CircularTransfer, DmaChannel, DmaRequest, InvalidParameters, TransferErrors, TransferOptions};
+use crate::dma::{Channel, CircularTransfer, DmaChannel, DmaRequest, InvalidParameters, TransferErrors, TransferOptions, Word};
 
 pub(crate) struct Info {
     pub(crate) regs: pac::Flexio,
@@ -533,12 +533,19 @@ impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
     }
 
     /// Single-shot LSB-first write to the shifter (SHIFTBUF).
-    pub async fn write(&mut self, buf: &[u32]) -> Result<(), InvalidParameters> {
+    ///
+    /// The DMA beat width matches the word size of `W`: use `u32` for full-word
+    /// transfers, `u16` to write only the low halfword of SHIFTBUF, or `u8` to
+    /// write only the low byte.  Upper bytes of SHIFTBUF that are not written
+    /// retain their previous value but are never clocked if the timer is
+    /// configured for fewer bits than the register width.
+    pub async fn write<W: Word>(&mut self, buf: &[W]) -> Result<(), InvalidParameters> {
         self.shifter.enable_dma();
+        let peri_addr = self.shifter.dma_address() as *mut W;
         let r = unsafe {
             self.dma.write_to_peripheral(
                 buf,
-                self.shifter.dma_address(),
+                peri_addr,
                 Shifter::<N>::dma_request(),
                 TransferOptions::COMPLETE_INTERRUPT,
             )
@@ -550,12 +557,16 @@ impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
     }
 
     /// Single-shot MSB-first write via SHIFTBUFBIS (bit-swapped).
-    pub async fn write_bis(&mut self, buf: &[u32]) -> Result<(), InvalidParameters> {
+    ///
+    /// Same word-width semantics as [`write`](Self::write), but targets SHIFTBUFBIS
+    /// so that bit 31 of the written value is shifted out first.
+    pub async fn write_bis<W: Word>(&mut self, buf: &[W]) -> Result<(), InvalidParameters> {
         self.shifter.enable_dma();
+        let peri_addr = self.shifter.dma_address_bis() as *mut W;
         let r = unsafe {
             self.dma.write_to_peripheral(
                 buf,
-                self.shifter.dma_address_bis(),
+                peri_addr,
                 Shifter::<N>::dma_request(),
                 TransferOptions::COMPLETE_INTERRUPT,
             )

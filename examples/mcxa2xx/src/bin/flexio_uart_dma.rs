@@ -47,8 +47,6 @@ impl From<TransferErrors> for Error {
     }
 }
 
-const CHUNK_WORDS: usize = 64;
-
 pub struct FlexioUartTx<'d> {
     sdma: ShifterDma<'d, 'd, 0>,
     #[allow(dead_code)]
@@ -109,17 +107,17 @@ impl<'d> FlexioUartTx<'d> {
     }
 
     pub async fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        const CHUNK: usize = 64;
         let mut offset = 0;
         while offset < data.len() {
-            let end = (offset + CHUNK_WORDS).min(data.len());
+            let end = (offset + CHUNK).min(data.len());
             let chunk = &data[offset..end];
-
-            let mut buf = [0u32; CHUNK_WORDS];
+            let mut buf = [0u16; CHUNK];
             for (i, &byte) in chunk.iter().enumerate() {
-                buf[i] = ((byte as u32) << 1) | 0xFFFF_FE00;
+                // start(0) at bit 0, data in bits 1-8, stop(1) at bit 9
+                buf[i] = ((byte as u16) << 1) | 0xFE00;
             }
-
-            self.write_words_dma(&buf[..chunk.len()]).await?;
+            self.sdma.write(&buf[..chunk.len()]).await?;
             offset = end;
         }
         Ok(())
@@ -130,10 +128,6 @@ impl<'d> FlexioUartTx<'d> {
         while !self.sdma.shifter().is_status_set() {
             core::hint::spin_loop();
         }
-    }
-
-    async fn write_words_dma(&mut self, words: &[u32]) -> Result<(), Error> {
-        self.sdma.write(words).await.map_err(Error::from)
     }
 }
 
