@@ -5,7 +5,7 @@
 //! giving the CPU one half-period to refill the idle half while hardware
 //! streams the other.
 //!
-//! Hardware: FRDM-MCXA256 (mcxa2xx).
+//! Hardware: FRDM-MCXA266 (mcxa2xx).
 //!
 //! Wiring (Arduino header, alt-6):
 //!   P4_4 → BCLK  (FXIO_D10, lane 10)

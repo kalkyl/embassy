@@ -3,7 +3,7 @@
 //! Demonstrates using the FlexIO HAL to implement a software UART transmitter
 //! that sends bytes via DMA — the CPU is not involved while data shifts out.
 //!
-//! Hardware: FRDM-MCXA256 (mcxa2xx).
+//! Hardware: FRDM-MCXA266 (mcxa2xx).
 //!
 //! Wiring: connect a USB-UART adapter to P3_28 (FXIO_D0, alt-6).
 //!

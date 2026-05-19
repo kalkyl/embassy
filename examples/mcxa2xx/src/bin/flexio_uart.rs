@@ -4,7 +4,7 @@
 //! in application code. Only the HAL building-blocks live in `embassy-mcxa`;
 //! the protocol personality (`FlexioUartTx`) lives here.
 //!
-//! Hardware: FRDM-MCXA256 (mcxa2xx).
+//! Hardware: FRDM-MCXA266 (mcxa2xx).
 //!
 //! Wiring: connect a USB-UART adapter to P0_16 (FXIO_D0, alt-6).
 //!
@@ -27,8 +27,6 @@ use hal::peripherals::FLEXIO0;
 use embassy_mcxa::clocks::config::Div8;
 use {defmt_rtt as _, embassy_mcxa as hal, panic_probe as _};
 
-/// 8N1 UART transmitter. 
-/// Lane generic removed from struct!
 pub struct FlexioUartTx<'d> {
     shifter: Shifter<'d, 0>,
     #[allow(dead_code)]
@@ -36,7 +34,6 @@ pub struct FlexioUartTx<'d> {
 }
 
 impl<'d> FlexioUartTx<'d> {
-    /// The generic 'L' is now local to this function.
     pub fn new<P: FlexioPin<FLEXIO0, L>, const L: usize>(
         mut shifter: Shifter<'d, 0>,
         mut timer: FlexTimer<'d, 0>,
@@ -46,7 +43,6 @@ impl<'d> FlexioUartTx<'d> {
     ) -> Self {
         tx_pin.as_flexio_lane();
 
-        // Extract the lane number from the generic L
         let lane = L as u8;
 
         let baud_div = (flexio_clk / (4 * baud)) as u16;
@@ -61,7 +57,7 @@ impl<'d> FlexioUartTx<'d> {
             timout: Timout::One,
             tstop: Tstop::EnableTmrdisable,
             tstart: true,
-            pin_select: lane, // Use the extracted lane
+            pin_select: lane,
             pin_cfg: TimctlPincfg::Outdisable,
             pin_pol: TimctlPinpol::ActiveHigh,
             trigger: TimerTrigger::InternalShifterFlag {
@@ -73,7 +69,7 @@ impl<'d> FlexioUartTx<'d> {
 
         shifter.set_config(&ShifterConfig {
             smod: Smod::Transmit,
-            pin_select: lane, // Use the extracted lane
+            pin_select: lane,
             pin_cfg: ShiftctlPincfg::Output,
             pin_pol: ShiftctlPinpol::ActiveHigh,
             timer_pol: Timpol::Negedge,
@@ -108,11 +104,11 @@ async fn main(_spawner: Spawner) {
 
     defmt::info!("FlexIO UART Tx example");
 
-    let flexio_clk_hz = 24_000_000u32; // 24 MHz
+    let flexio_clk_hz = 24_000_000u32;
     let flexio_cfg = FlexioConfig {
         power: PoweredClock::NormalEnabledDeepSleepDisabled,
         source: FlexioClockSel::FroHfGated,
-        div: Div4::from_divisor(4).unwrap(), // Divide 96MHz by 4 to get 24MHz
+        div: Div4::from_divisor(4).unwrap(),
     };
     let flexio = Flexio::new(p.FLEXIO0, flexio_cfg).expect("FlexIO init failed");
     let (mut shifters, mut timers) = flexio.split();
