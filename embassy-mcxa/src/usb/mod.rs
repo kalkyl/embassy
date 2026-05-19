@@ -340,7 +340,9 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
         usb.istat().write_value(pac::Istat(0xff));
         usb.errstat().write_value(pac::Errstat(0xff));
         usb.erren().write_value(pac::Erren(0xff));
-        usb.inten().write_value(pac::Inten(0xbb));
+        // RESUMEEN starts disabled; enter_suspend/exit_suspend toggle it so SLEEP and
+        // RESUME are never both armed at once, preventing a poll() race that drops Resume.
+        usb.inten().write_value(pac::Inten(0x9b));
         usb.clk_recover_int_en().write_value(pac::ClkRecoverIntEn(0x00));
         clear_clock_recovery_interrupt();
 
@@ -389,14 +391,20 @@ impl embassy_usb_driver::Bus for Bus<'_> {
                 return Poll::Ready(Event::PowerDetected);
             }
 
-            let events = STATE.events.swap(0, Ordering::Acquire);
+            // Process one event at a time: if SUSPEND and RESUME both accumulated
+            // before poll() ran, fetch_and preserves the second bit so it is seen
+            // on the next call rather than being silently dropped by a swap(0).
+            let events = STATE.events.load(Ordering::Acquire);
             if events & EVENT_RESET != 0 {
+                STATE.events.fetch_and(!EVENT_RESET, Ordering::AcqRel);
                 return Poll::Ready(Event::Reset);
             }
             if events & EVENT_SUSPEND != 0 {
+                STATE.events.fetch_and(!EVENT_SUSPEND, Ordering::AcqRel);
                 return Poll::Ready(Event::Suspend);
             }
             if events & EVENT_RESUME != 0 {
+                STATE.events.fetch_and(!EVENT_RESUME, Ordering::AcqRel);
                 return Poll::Ready(Event::Resume);
             }
 
@@ -561,12 +569,6 @@ impl embassy_usb_driver::ControlPipe for ControlPipe<'_> {
         })
         .await?;
 
-        if last {
-            start_ep0_in(&[])?;
-            prime_ep0_out_setup();
-            wait_in_done(0, || STATE.ep_out_ready[0].load(Ordering::Acquire) != OUT_EMPTY).await?;
-        }
-
         Ok(len)
     }
 
@@ -575,12 +577,13 @@ impl embassy_usb_driver::ControlPipe for ControlPipe<'_> {
             set_data1(&STATE.ep_in_data1, 0, true);
         }
         start_ep0_in(data)?;
-        wait_in_done(0, || STATE.ep_out_ready[0].load(Ordering::Acquire) != OUT_EMPTY).await?;
+        // Prime the status-stage OUT buffer before awaiting the IN completion so
+        // the host can deliver the status ZLP immediately without a NAK round-trip.
         if last {
             set_data1(&STATE.ep_out_data1, 0, true);
             prime_out_ep(0, self.max_packet_size);
         }
-        Ok(())
+        wait_in_done(0, || STATE.ep_out_ready[0].load(Ordering::Acquire) != OUT_EMPTY).await
     }
 
     async fn accept(&mut self) {
@@ -932,6 +935,27 @@ fn clear_clock_recovery_interrupt() {
         .write_value(pac::ClkRecoverIntStatus(0x10));
 }
 
+// Swap INTEN so only RESUME (not SLEEP) fires next, and flush both ISTAT bits.
+// USBCTRL.SUSP is intentionally not set: that is a low-power-mode feature
+// (NXP SDK USB_DEVICE_CONFIG_LOW_POWER_MODE) that halts the transceiver on any
+// 3 ms SOF gap, making the device appear dead during normal USB activity.
+fn enter_suspend(usb: pac::Usb) {
+    usb.inten().modify(|w| {
+        w.set_sleepen(pac::Sleepen::DisSleepInt);
+        w.set_resumeen(pac::Resumeen::EnResumeInt);
+    });
+    usb.istat().write_value(pac::Istat(ISTAT_SLEEP | ISTAT_RESUME));
+}
+
+// Re-arm SLEEP, disarm RESUME, flush both ISTAT bits.
+fn exit_suspend(usb: pac::Usb) {
+    usb.inten().modify(|w| {
+        w.set_resumeen(pac::Resumeen::DisResumeInt);
+        w.set_sleepen(pac::Sleepen::EnSleepInt);
+    });
+    usb.istat().write_value(pac::Istat(ISTAT_RESUME | ISTAT_SLEEP));
+}
+
 fn prime_ep0_out_setup() {
     STATE.ep_out_ready[0].store(OUT_EMPTY, Ordering::Release);
     STATE.ep_out_token[0].store(0, Ordering::Release);
@@ -1000,8 +1024,9 @@ fn on_interrupt() {
     if usbtrc0.usb_clk_recovery_int() {
         clear_clock_recovery_interrupt();
     }
-
-    let istat = usb.istat().read().0;
+    // Mask by INTEN: while RESUMEEN=0 a pending RESUME bit in ISTAT is invisible,
+    // so SLEEP and RESUME can never both appear in the same istat snapshot.
+    let mut istat = usb.istat().read().0 & usb.inten().read().0;
 
     if istat & ISTAT_USBRST != 0 {
         for ep in 1..HW_EP_COUNT {
@@ -1011,6 +1036,7 @@ fn on_interrupt() {
         usb.addr().write_value(pac::Addr(0));
         reset_state();
         clear_bdt();
+        exit_suspend(usb);
         usb.ctl().modify(|w| w.set_oddrst(true));
         usb.ctl().modify(|w| w.set_oddrst(false));
         prime_ep0_out_setup();
@@ -1019,18 +1045,19 @@ fn on_interrupt() {
         STATE.events.fetch_or(EVENT_RESET, Ordering::Release);
         STATE.bus_waker.wake();
         usb.istat().write_value(pac::Istat(ISTAT_USBRST));
+        istat &= !(ISTAT_SLEEP | ISTAT_RESUME);
     }
 
     if istat & ISTAT_SLEEP != 0 {
+        enter_suspend(usb);
         STATE.events.fetch_or(EVENT_SUSPEND, Ordering::Release);
         STATE.bus_waker.wake();
-        usb.istat().write_value(pac::Istat(ISTAT_SLEEP));
     }
 
     if istat & ISTAT_RESUME != 0 {
+        exit_suspend(usb);
         STATE.events.fetch_or(EVENT_RESUME, Ordering::Release);
         STATE.bus_waker.wake();
-        usb.istat().write_value(pac::Istat(ISTAT_RESUME));
     }
 
     if istat & ISTAT_TOKDNE != 0 {
