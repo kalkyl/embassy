@@ -27,7 +27,6 @@ use hal::peripherals::FLEXIO0;
 use embassy_mcxa::clocks::config::Div8;
 use {defmt_rtt as _, embassy_mcxa as hal, panic_probe as _};
 
-
 #[derive(Debug, defmt::Format)]
 pub enum Error {
     /// Buffer was empty or exceeded the DMA transfer size limit.
@@ -148,6 +147,7 @@ async fn main(_spawner: Spawner) {
     defmt::info!("FlexIO UART DMA Tx example");
 
     // FRO_HF defaults to 45 MHz on MCXA2xx; 45 / 3 = 15 MHz.
+    let flexio_clk_hz = 15_000_000u32;
     let flexio_cfg = FlexioConfig {
         power: PoweredClock::NormalEnabledDeepSleepDisabled,
         source: FlexioClockSel::FroHfGated,
@@ -163,7 +163,7 @@ async fn main(_spawner: Spawner) {
         p.P3_28,
         p.DMA0_CH0,
         115_200,
-        15_000_000,
+        flexio_clk_hz,
     );
 
     let mut counter: u32 = 0;

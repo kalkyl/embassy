@@ -33,7 +33,6 @@ use embassy_mcxa::clocks::config::Div8;
 use static_cell::ConstStaticCell;
 use {defmt_rtt as _, embassy_mcxa as hal, panic_probe as _};
 
-
 #[derive(Debug, defmt::Format)]
 pub enum Error {
     InvalidParameters,
@@ -198,6 +197,7 @@ async fn main(_spawner: Spawner) {
     defmt::info!("FlexIO I2S TX DMA example");
 
     // FRO_HF defaults to 45 MHz on MCXA2xx; 45 / 3 = 15 MHz.
+    let flexio_clk_hz = 15_000_000u32;
     let flexio_cfg = FlexioConfig {
         power: PoweredClock::NormalEnabledDeepSleepDisabled,
         source: FlexioClockSel::FroHfGated,
@@ -216,7 +216,7 @@ async fn main(_spawner: Spawner) {
         p.P0_7,    // SD   → FXIO_D12, lane 12
         p.DMA0_CH0,
         48_000,
-        15_000_000,
+        flexio_clk_hz,
     );
 
     // Square-wave generator — each u32 packs a 16-bit left and right sample.
