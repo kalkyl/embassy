@@ -1,23 +1,9 @@
-//! FlexIO I2S TX ping-pong DMA example (async, single circular buffer).
+//! FlexIO I2S TX DMA example (async).
 //!
-//! Identical FlexIO wiring to `flexio_i2s_dma.rs`, but uses a single large
-//! buffer with the eDMA INTHALF + INTMAJOR interrupts instead of two separate
-//! buffers and TCD scatter-gather chaining.
-//!
-//! # How it works
-//!
-//! A single 1024-word buffer holds two 512-word halves back-to-back.
-//! The DMA major-loop count is 1024 and `SLAST` is set to −4096 bytes, so the
-//! source address wraps back to the start of the buffer after every pass.
-//! `INTHALF` fires when the counter reaches 512 (first half just finished);
-//! `INTMAJOR` fires when it reaches 0 (second half just finished).
-//! `I2sStream::next_half()` awaits those interrupts and returns 0 or 1,
-//! giving the CPU one half-period to refill the idle half.
-//!
-//! Compared to `flexio_i2s_tcd.rs`:
-//!   - No TCD pool or scatter-gather required
-//!   - One static buffer instead of three statics
-//!   - Simpler DMA configuration (no ESG, no dlast_sga chain)
+//! Streams audio from a 1024-word circular buffer to the shifter via DMA.
+//! INTHALF and INTMAJOR interrupts fire at the midpoint and end of each pass,
+//! giving the CPU one half-period to refill the idle half while hardware
+//! streams the other.
 //!
 //! Hardware: FRDM-MCXA256 (mcxa2xx).
 //!
@@ -47,9 +33,6 @@ use embassy_mcxa::clocks::config::Div8;
 use static_cell::ConstStaticCell;
 use {defmt_rtt as _, embassy_mcxa as hal, panic_probe as _};
 
-// ---------------------------------------------------------------------------
-// Error types
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, defmt::Format)]
 pub enum Error {
@@ -69,17 +52,9 @@ impl From<TransferErrors> for Error {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Static DMA storage — one buffer, twice the half-size.
-// ---------------------------------------------------------------------------
-
 const HALF_LEN: usize = 512;
 
 static BUF: ConstStaticCell<[u32; HALF_LEN * 2]> = ConstStaticCell::new([0; HALF_LEN * 2]);
-
-// ---------------------------------------------------------------------------
-// Driver
-// ---------------------------------------------------------------------------
 
 pub struct FlexioI2sTx<'d> {
     sdma: ShifterDma<'d, 'd, 0>,
@@ -99,15 +74,15 @@ pub struct I2sStream<'d> {
 }
 
 impl<'d> I2sStream<'d> {
-    /// Wait for the next half to finish.
+    /// Wait for the next half-buffer to finish.
     ///
-    /// Returns `Ok(0)` when the first half finished, `Ok(1)` when the second
-    /// half finished.
+    /// Returns `Ok(0)` when the first half finished, `Ok(1)` when the second.
+    /// Alternates strictly 0, 1, 0, 1, …
     pub async fn next_half(&mut self) -> Result<u8, Error> {
         self.stream.next_half().await.map_err(Error::from)
     }
 
-    /// Refill the half that [`next_half`] just reported idle.
+    /// Call `f` with the half that [`next_half`] just reported idle.
     pub fn fill_idle<F: FnOnce(&mut [u32])>(&mut self, idx: u8, f: F) {
         self.stream.fill_idle(idx, f);
     }
@@ -201,15 +176,9 @@ impl<'d> FlexioI2sTx<'d> {
         }
     }
 
-    /// Consume the driver and start a continuous stream.
-    ///
-    /// `buf` is a single `&'static mut [u32]` of length `2 × HALF_LEN`.
-    /// It is consumed here so no live alias exists while DMA runs.
-    /// Pre-fill both halves before calling so the stream starts with valid audio.
-    pub fn start_stream(
-        self,
-        buf: &'static mut [u32],
-    ) -> Result<I2sStream<'d>, Error> {
+    /// Consume the driver and start streaming `buf` to the I2S shifter.
+    /// Pre-fill both halves before calling so the stream opens with valid audio.
+    pub fn start_stream(self, buf: &'static mut [u32]) -> Result<I2sStream<'d>, Error> {
         let stream = self.sdma.start_stream_bis(buf)?;
         Ok(I2sStream {
             stream,
@@ -219,10 +188,6 @@ impl<'d> FlexioI2sTx<'d> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Application
-// ---------------------------------------------------------------------------
-
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let mut cfg = hal::config::Config::default();
@@ -230,7 +195,7 @@ async fn main(_spawner: Spawner) {
     cfg.clock_cfg.sirc.fro_lf_div = Some(Div8::no_div());
     let p = hal::init(cfg);
 
-    defmt::info!("FlexIO I2S TX INTHALF example");
+    defmt::info!("FlexIO I2S TX DMA example");
 
     let flexio_cfg = FlexioConfig {
         power: PoweredClock::NormalEnabledDeepSleepDisabled,
@@ -263,7 +228,6 @@ async fn main(_spawner: Spawner) {
         }
     };
 
-    // Consume the driver and the buffer into a running stream.
     let mut stream = i2s.start_stream(BUF.take()).unwrap();
 
     loop {

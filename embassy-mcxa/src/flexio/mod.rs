@@ -11,6 +11,7 @@
 //! application or example code, not here.
 
 use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
 
 use embassy_hal_internal::{Peri, PeripheralType};
 
@@ -517,10 +518,6 @@ impl<'d, const N: usize> Timer<'d, N> {
     }
 }
 
-// ============================================================================
-// ShifterDma — Shifter paired with a DMA channel
-// ============================================================================
-
 /// A [`Shifter`] paired with a DMA channel for DMA-driven transfers.
 ///
 /// Obtained via [`Shifter::with_dma`].
@@ -536,8 +533,6 @@ impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
     }
 
     /// Single-shot LSB-first write to the shifter (SHIFTBUF).
-    ///
-    /// Suitable for UART-style protocols where bit0 is shifted out first.
     pub async fn write(&mut self, buf: &[u32]) -> Result<(), InvalidParameters> {
         self.shifter.enable_dma();
         let r = unsafe {
@@ -555,8 +550,6 @@ impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
     }
 
     /// Single-shot MSB-first write via SHIFTBUFBIS (bit-swapped).
-    ///
-    /// Suitable for I2S-style protocols where bit31 is shifted out first.
     pub async fn write_bis(&mut self, buf: &[u32]) -> Result<(), InvalidParameters> {
         self.shifter.enable_dma();
         let r = unsafe {
@@ -592,7 +585,7 @@ impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
                 Shifter::<N>::dma_request(),
             )
         }?;
-        Ok(ShifterStream { shifter: self.shifter, transfer: core::mem::ManuallyDrop::new(transfer) })
+        Ok(ShifterStream { shifter: self.shifter, transfer: ManuallyDrop::new(transfer) })
     }
 
     /// Start a continuous MSB-first circular DMA stream via SHIFTBUFBIS.
@@ -613,13 +606,9 @@ impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
                 Shifter::<N>::dma_request(),
             )
         }?;
-        Ok(ShifterStream { shifter: self.shifter, transfer: core::mem::ManuallyDrop::new(transfer) })
+        Ok(ShifterStream { shifter: self.shifter, transfer: ManuallyDrop::new(transfer) })
     }
 }
-
-// ============================================================================
-// ShifterStream — running circular DMA stream tied to a shifter
-// ============================================================================
 
 /// An infinite circular DMA stream from memory to a FlexIO shifter.
 ///
@@ -634,7 +623,7 @@ impl<'d, 'ch, const N: usize> ShifterDma<'d, 'ch, N> {
 /// Dropping the stream stops the DMA and clears the shifter's DMA-request enable.
 pub struct ShifterStream<'d, 'ch, const N: usize> {
     shifter: Shifter<'d, N>,
-    transfer: core::mem::ManuallyDrop<CircularTransfer<'ch, u32>>,
+    transfer: ManuallyDrop<CircularTransfer<'ch, u32>>,
 }
 
 // SAFETY: CircularTransfer is Send; Shifter is Send.
@@ -659,7 +648,7 @@ impl<'d, 'ch, const N: usize> ShifterStream<'d, 'ch, N> {
 impl<'d, 'ch, const N: usize> Drop for ShifterStream<'d, 'ch, N> {
     fn drop(&mut self) {
         // Drop CircularTransfer first: disables ERQ, interrupts, drains active loop.
-        unsafe { core::mem::ManuallyDrop::drop(&mut self.transfer) };
+        unsafe { ManuallyDrop::drop(&mut self.transfer) };
         // Then clear the shifter's DMA-request enable (SHIFTSDEN bit).
         self.shifter.disable_dma();
     }
