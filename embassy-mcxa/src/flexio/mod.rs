@@ -14,9 +14,9 @@ use core::marker::PhantomData;
 
 use embassy_hal_internal::{Peri, PeripheralType};
 
-pub(crate) mod pac;
+use crate::pac::flexio as pac;
 
-pub use pac::vals::{
+pub use pac::{
     Insrc, Latst, ShiftctlPincfg, ShiftctlPinpol, Smod, Ssize, Sstart, Sstop, Ssf, TimctlPincfg,
     TimctlPinpol, Timdec, Timdis, Timena, Timod, Timout, Timrst, Timpol, Trgpol, Trgsrc, Tsf,
     Tstop,
@@ -73,7 +73,7 @@ macro_rules! impl_flexio_instance {
                 fn info() -> &'static crate::flexio::Info {
                     use crate::clocks::Gate;
                     static INFO: crate::flexio::Info = crate::flexio::Info {
-                        regs: crate::flexio::pac::[<FLEXIO $n>],
+                        regs: crate::pac::[<FLEXIO $n>],
                         mrcc_disable: crate::clocks::disable::<crate::peripherals::[<FLEXIO $n>]>,
                     };
                     &INFO
@@ -145,15 +145,15 @@ pub struct ShifterConfig {
 impl Default for ShifterConfig {
     fn default() -> Self {
         Self {
-            smod: Smod::DISABLE,
+            smod: Smod::Disable,
             pin_select: 0,
-            pin_cfg: ShiftctlPincfg::DISABLE,
-            pin_pol: ShiftctlPinpol::ACTIVE_HIGH,
-            timer_pol: Timpol::POSEDGE,
+            pin_cfg: ShiftctlPincfg::Disable,
+            pin_pol: ShiftctlPinpol::ActiveHigh,
+            timer_pol: Timpol::Posedge,
             timer_select: 0,
-            start_bit: Sstart::VALUE00,
-            stop_bit: Sstop::VALUE00,
-            input_source: Insrc::PIN,
+            start_bit: Sstart::Value00,
+            stop_bit: Sstop::Value00,
+            input_source: Insrc::Pin,
         }
     }
 }
@@ -208,17 +208,17 @@ pub struct TimerConfig {
 impl Default for TimerConfig {
     fn default() -> Self {
         Self {
-            timod: Timod::DISABLE,
-            timdec: Timdec::FLEXIO_CLK_SHIFTCLK_TMR_OUT,
-            timena: Timena::ENABLE,
-            timdis: Timdis::NEVER,
-            timrst: Timrst::NEVER,
-            timout: Timout::ONE,
-            tstop: Tstop::STOP_DISABLE,
+            timod: Timod::Disable,
+            timdec: Timdec::FlexioClkShiftclkTmrOut,
+            timena: Timena::Enable,
+            timdis: Timdis::Never,
+            timrst: Timrst::Never,
+            timout: Timout::One,
+            tstop: Tstop::StopDisable,
             tstart: false,
             pin_select: 0,
-            pin_cfg: TimctlPincfg::OUTDISABLE,
-            pin_pol: TimctlPinpol::ACTIVE_HIGH,
+            pin_cfg: TimctlPincfg::Outdisable,
+            pin_pol: TimctlPinpol::ActiveHigh,
             trigger: TimerTrigger::None,
             compare: 0,
         }
@@ -527,17 +527,17 @@ impl<'d, const N: usize> Timer<'d, N> {
 
         // Resolve trigger fields from the high-level enum.
         let (trgsrc, trgpol, trgsel) = match cfg.trigger {
-            TimerTrigger::None => (Trgsrc::EXT_TRIG, Trgpol::ACTIVE_HIGH, 0u8),
+            TimerTrigger::None => (Trgsrc::ExtTrig, Trgpol::ActiveHigh, 0u8),
             TimerTrigger::InternalLane { lane, polarity } => {
                 // TRGSEL = 4 × lane selects the pin/lane input.
-                (Trgsrc::INTERNAL_TRIG, polarity, 4 * lane)
+                (Trgsrc::InternalTrig, polarity, 4 * lane)
             }
             TimerTrigger::InternalShifterFlag { shifter, polarity } => {
                 // TRGSEL = 4 × shifter + 1 selects shifter status flag.
-                (Trgsrc::INTERNAL_TRIG, polarity, 4 * shifter + 1)
+                (Trgsrc::InternalTrig, polarity, 4 * shifter + 1)
             }
             TimerTrigger::External { trgsel, polarity } => {
-                (Trgsrc::EXT_TRIG, polarity, trgsel)
+                (Trgsrc::ExtTrig, polarity, trgsel)
             }
         };
 

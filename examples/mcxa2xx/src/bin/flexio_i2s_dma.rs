@@ -134,17 +134,17 @@ impl<'d> FlexioI2sTx<'d> {
         // that toggles every 16 BCLKs.  This matches the NXP SDK reference
         // implementation (fsl_flexio_i2s.c).
         ws_timer.set_config(&TimerConfig {
-            timod: Timod::SINGLE16BIT,
-            timdec: Timdec::FLEXIO_CLK_SHIFTCLK_TMR_OUT,
-            timena: Timena::TMR_NMINUS1_EN,
-            timdis: Timdis::NEVER,
-            timrst: Timrst::NEVER,
-            timout: Timout::ONE,
-            tstop: Tstop::STOP_DISABLE,
+            timod: Timod::Single16bit,
+            timdec: Timdec::FlexioClkShiftclkTmrOut,
+            timena: Timena::TmrNminus1En,
+            timdis: Timdis::Never,
+            timrst: Timrst::Never,
+            timout: Timout::One,
+            tstop: Tstop::StopDisable,
             tstart: false,
             pin_select: ws_lane,
-            pin_cfg: TimctlPincfg::OUTPUT,
-            pin_pol: TimctlPinpol::ACTIVE_LOW,
+            pin_cfg: TimctlPincfg::Output,
+            pin_pol: TimctlPinpol::ActiveLow,
             trigger: TimerTrigger::None,
             compare: ws_compare,
         });
@@ -155,20 +155,20 @@ impl<'d> FlexioI2sTx<'d> {
         // the rising enable edge produced here.  Both timers then run from the
         // same FlexIO clock, keeping WS phase-locked to BCLK.
         bclk_timer.set_config(&TimerConfig {
-            timod: Timod::DUAL8BIT_BAUD,
-            timdec: Timdec::FLEXIO_CLK_SHIFTCLK_TMR_OUT,
-            timena: Timena::TMR_TRIGHI_EN,
-            timdis: Timdis::NEVER,
-            timrst: Timrst::NEVER,
-            timout: Timout::ONE,
-            tstop: Tstop::STOP_DISABLE,
+            timod: Timod::Dual8bitBaud,
+            timdec: Timdec::FlexioClkShiftclkTmrOut,
+            timena: Timena::TmrTrighiEn,
+            timdis: Timdis::Never,
+            timrst: Timrst::Never,
+            timout: Timout::One,
+            tstop: Tstop::StopDisable,
             tstart: true,
             pin_select: bclk_lane,
-            pin_cfg: TimctlPincfg::OUTPUT,
-            pin_pol: TimctlPinpol::ACTIVE_HIGH,
+            pin_cfg: TimctlPincfg::Output,
+            pin_pol: TimctlPinpol::ActiveHigh,
             trigger: TimerTrigger::InternalShifterFlag {
                 shifter: 0,
-                polarity: Trgpol::ACTIVE_LOW,
+                polarity: Trgpol::ActiveLow,
             },
             compare: t0_compare,
         });
@@ -181,15 +181,15 @@ impl<'d> FlexioI2sTx<'d> {
         // No start/stop bits: the 1-bit WS-to-data delay is controlled by
         // the timer relationship established above.
         shifter.set_config(&ShifterConfig {
-            smod: Smod::TRANSMIT,
+            smod: Smod::Transmit,
             pin_select: sd_lane,
-            pin_cfg: ShiftctlPincfg::OUTPUT,
-            pin_pol: ShiftctlPinpol::ACTIVE_HIGH,
-            timer_pol: Timpol::POSEDGE,
+            pin_cfg: ShiftctlPincfg::Output,
+            pin_pol: ShiftctlPinpol::ActiveHigh,
+            timer_pol: Timpol::Posedge,
             timer_select: 0,
-            start_bit: Sstart::VALUE00,
-            stop_bit: Sstop::VALUE00,
-            input_source: Insrc::PIN,
+            start_bit: Sstart::Value00,
+            stop_bit: Sstop::Value00,
+            input_source: Insrc::Pin,
         });
 
         // DMA enable is permanent: the DMA channel's ERQ bit gates actual

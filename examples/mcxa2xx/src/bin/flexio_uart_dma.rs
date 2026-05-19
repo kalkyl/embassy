@@ -73,34 +73,34 @@ impl<'d> FlexioUartTx<'d> {
         let compare: u16 = (0x15u16 << 8) | (baud_div.saturating_sub(1) & 0xFF);
 
         timer.set_config(&TimerConfig {
-            timod: Timod::DUAL8BIT_BAUD,
-            timdec: Timdec::FLEXIO_CLK_SHIFTCLK_TMR_OUT,
-            timena: Timena::TMR_TRIGHI_EN,
-            timdis: Timdis::TMR_CMP,
-            timrst: Timrst::NEVER,
-            timout: Timout::ONE,
-            tstop: Tstop::ENABLE_TMRDISABLE,
+            timod: Timod::Dual8bitBaud,
+            timdec: Timdec::FlexioClkShiftclkTmrOut,
+            timena: Timena::TmrTrighiEn,
+            timdis: Timdis::TmrCmp,
+            timrst: Timrst::Never,
+            timout: Timout::One,
+            tstop: Tstop::EnableTmrdisable,
             tstart: true,
             pin_select: lane,
-            pin_cfg: TimctlPincfg::OUTDISABLE,
-            pin_pol: TimctlPinpol::ACTIVE_HIGH,
+            pin_cfg: TimctlPincfg::Outdisable,
+            pin_pol: TimctlPinpol::ActiveHigh,
             trigger: TimerTrigger::InternalShifterFlag {
                 shifter: 0,
-                polarity: Trgpol::ACTIVE_LOW,
+                polarity: Trgpol::ActiveLow,
             },
             compare,
         });
 
         shifter.set_config(&ShifterConfig {
-            smod: Smod::TRANSMIT,
+            smod: Smod::Transmit,
             pin_select: lane,
-            pin_cfg: ShiftctlPincfg::OUTPUT,
-            pin_pol: ShiftctlPinpol::ACTIVE_HIGH,
-            timer_pol: Timpol::NEGEDGE,
+            pin_cfg: ShiftctlPincfg::Output,
+            pin_pol: ShiftctlPinpol::ActiveHigh,
+            timer_pol: Timpol::Negedge,
             timer_select: 0,
-            start_bit: Sstart::VALUE10,
-            stop_bit: Sstop::VALUE11,
-            input_source: Insrc::PIN,
+            start_bit: Sstart::Value10,
+            stop_bit: Sstop::Value11,
+            input_source: Insrc::Pin,
         });
 
         Self {
