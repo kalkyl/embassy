@@ -134,7 +134,7 @@ impl Default for ShifterConfig {
 pub enum TimerTrigger {
     /// No external/internal trigger (timer is always enabled).
     None,
-    /// Internal trigger from a FlexIO lane (BCLK/FS sync).
+    /// Internal trigger from a FlexIO lane.
     ///
     /// `lane` is the FXIO_Dn index; `polarity` selects active-high/low.
     InternalLane { lane: u8, polarity: Trgpol },
@@ -349,8 +349,7 @@ impl<'d, const N: usize> Shifter<'d, N> {
 
     /// Write a 32-bit word to the shifter transmit buffer (SHIFTBUF).
     ///
-    /// FlexIO transmits bit0 first (LSB-first). Use this for UART and other
-    /// LSB-first protocols where the byte is placed in the low bits of the word.
+    /// FlexIO shifts bit0 out first (LSB-first). Place data in the low bits of the word.
     #[inline]
     pub fn write_buffer(&mut self, data: u32) {
         self.info.regs().shiftbuf(N).write(|w| w.set_shiftbuf(data));
@@ -359,8 +358,7 @@ impl<'d, const N: usize> Shifter<'d, N> {
     /// Write a 32-bit word to the shifter via SHIFTBUFBIS (Bit-Swapped buffer).
     ///
     /// SHIFTBUFBIS maps bit0 of the written value to bit31 of the shift register,
-    /// so FlexIO transmits bit31 of the written value first (MSB-first). Use this
-    /// for I2S and other MSB-first protocols.
+    /// so FlexIO shifts bit31 out first (MSB-first).
     #[inline]
     pub fn write_buffer_bis(&mut self, data: u32) {
         self.info.regs().shiftbufbis(N).write(|w| w.set_shiftbufbis(data));
@@ -378,19 +376,17 @@ impl<'d, const N: usize> Shifter<'d, N> {
         self.info.regs().shiftbufbis(N).read().shiftbufbis()
     }
 
-    /// Raw address of `SHIFTBUF[N]`, for DMA transfers that need LSB-first output.
+    /// Raw address of `SHIFTBUF[N]`, for DMA transfers requiring LSB-first output.
     ///
-    /// FlexIO transmits bit0 first from SHIFTBUF. Suitable for UART TX DMA.
-    /// For MSB-first protocols (I2S, SPI), use [`dma_address_bis`](Self::dma_address_bis).
+    /// For MSB-first output use [`dma_address_bis`](Self::dma_address_bis).
     #[inline]
     pub fn dma_address(&self) -> *mut u32 {
         self.info.regs().shiftbuf(N).as_ptr() as *mut u32
     }
 
-    /// Raw address of `SHIFTBUFBIS[N]`, for DMA transfers that need MSB-first output.
+    /// Raw address of `SHIFTBUFBIS[N]`, for DMA transfers requiring MSB-first output.
     ///
-    /// Writing to SHIFTBUFBIS reverses the bit order so that bit31 of the written
-    /// value is transmitted first. Matches the NXP SDK I2S TX DMA address.
+    /// Writing to SHIFTBUFBIS reverses bit order so that bit31 of the written value is shifted out first.
     #[inline]
     pub fn dma_address_bis(&self) -> *mut u32 {
         self.info.regs().shiftbufbis(N).as_ptr() as *mut u32
