@@ -61,16 +61,57 @@ const CLOCK_TYPE_INTERNAL_PROGRAMMABLE: u8 = 0x03;
 const CONTROL_RO: u8 = 0b01;
 const CONTROL_RW: u8 = 0b11;
 
-// Volume settings go from -100 dB to 0 dB in steps of 1 dB, as 8q8 values in units of dB.
+// Volume settings are 8q8 values in units of dB.
 const VOLUME_STEPS_PER_DB: i16 = 256;
-const MIN_VOLUME_DB: i16 = -100;
-const MAX_VOLUME_DB: i16 = 0;
+
+/// bInterval of the optional interrupt endpoint, in milliseconds.
+const INTERRUPT_INTERVAL_MS: u8 = 4;
+/// An interrupt data message: bInfo, bAttribute, wValue, wIndex.
+const INTERRUPT_MESSAGE_LEN: usize = 6;
 
 /// The CUR setting for silence (-∞ dB), which every volume control accepts
 /// regardless of its advertised range.
 const VOLUME_SILENCE_8Q8_DB: i16 = i16::MIN;
 
 const MAX_SAMPLE_RATE_COUNT: usize = 10;
+
+/// The volume range a Feature Unit advertises, in whole dB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct VolumeRange {
+    /// Lowest volume.
+    pub min_db: i8,
+    /// Highest volume.
+    pub max_db: i8,
+    /// Step between settings.
+    pub res_db: i8,
+}
+
+impl VolumeRange {
+    /// -100 dB to 0 dB in steps of 1 dB.
+    pub const DEFAULT: Self = Self {
+        min_db: -100,
+        max_db: 0,
+        res_db: 1,
+    };
+}
+
+impl Default for VolumeRange {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl VolumeRange {
+    fn contains_8q8(&self, volume: i16) -> bool {
+        (self.min_db as i16 * VOLUME_STEPS_PER_DB..=self.max_db as i16 * VOLUME_STEPS_PER_DB).contains(&volume)
+    }
+
+    /// The setting nearest to 0 dB, used until the host or the device sets one.
+    fn initial_8q8(&self) -> i16 {
+        0i16.clamp(self.min_db as i16, self.max_db as i16) * VOLUME_STEPS_PER_DB
+    }
+}
 
 /// Returns the control selector, the high byte of `wValue`, as defined in `uac2_codes`.
 fn selector(req: &Request) -> u16 {
@@ -99,6 +140,13 @@ pub struct Config<'d> {
     /// Controls the USB host can change on each line in channel, as
     /// [`Self::line_out_feature_unit`].
     pub line_in_feature_unit: Vec<FeatureUnitControls, MAX_AUDIO_CHANNEL_COUNT, u8>,
+    /// The volume range of the line out Feature Unit.
+    pub line_out_volume_range: VolumeRange,
+    /// The volume range of the line in Feature Unit.
+    pub line_in_volume_range: VolumeRange,
+    /// Add an AudioControl interrupt endpoint, so the host learns about volume and mute
+    /// changes the device makes itself ([`ControlMonitor::set_line_out_volume`]).
+    pub interrupt_endpoint: bool,
     /// Maximum bytes per line out packet: frames per microframe at the highest rate, plus one,
     /// times the frame size.
     pub line_out_max_packet_size: u16,
@@ -123,6 +171,9 @@ impl<'d> Config<'d> {
             line_in_channels,
             line_out_feature_unit: Vec::new(),
             line_in_feature_unit: Vec::new(),
+            line_out_volume_range: VolumeRange::DEFAULT,
+            line_in_volume_range: VolumeRange::DEFAULT,
+            interrupt_endpoint: false,
             line_out_max_packet_size,
             line_in_max_packet_size,
         }
@@ -151,6 +202,8 @@ pub struct IoBox<'d, D: Driver<'d>> {
     pub line_in: LineInStream<'d, D>,
     /// Line out's explicit feedback endpoint.
     pub feedback: Feedback<'d, D>,
+    /// The AudioControl interrupt endpoint, if [`Config::interrupt_endpoint`] is set.
+    pub interrupt: Option<Interrupt<'d, D>>,
     /// Control monitor.
     pub control_monitor: ControlMonitor<'d>,
 }
@@ -172,6 +225,9 @@ impl<'d, D: Driver<'d>> IoBox<'d, D> {
             line_in_channels,
             line_out_feature_unit,
             line_in_feature_unit,
+            line_out_volume_range,
+            line_in_volume_range,
+            interrupt_endpoint,
             line_out_max_packet_size,
             line_in_max_packet_size,
         } = config;
@@ -197,6 +253,12 @@ impl<'d, D: Driver<'d>> IoBox<'d, D> {
                     .iter()
                     .all(|controls| FeatureUnitControls::all().contains(*controls)),
                 "unsupported Feature Unit controls"
+            );
+        }
+        for range in [line_out_volume_range, line_in_volume_range] {
+            assert!(
+                range.min_db < range.max_db && range.res_db > 0,
+                "a volume range needs min < max and a positive step"
             );
         }
         assert!(
@@ -298,6 +360,8 @@ impl<'d, D: Driver<'d>> IoBox<'d, D> {
         for entity in entities {
             alt.descriptor(descriptor_type::CS_INTERFACE, entity);
         }
+        let interrupt_ep = interrupt_endpoint
+            .then(|| alt.endpoint_interrupt_in(None, INTERRUPT_MESSAGE_LEN as u16, INTERRUPT_INTERVAL_MS));
 
         let mut out_iface = func.interface();
         out_iface.alt_setting(
@@ -373,6 +437,19 @@ impl<'d, D: Driver<'d>> IoBox<'d, D> {
         shared.line_in_channels = line_in_channels;
         shared.line_out_controls = line_out_feature_unit;
         shared.line_in_controls = line_in_feature_unit;
+        shared.line_out_volume_range = line_out_volume_range;
+        shared.line_in_volume_range = line_in_volume_range;
+        for (settings, range) in [
+            (&shared.line_out_settings, line_out_volume_range),
+            (&shared.line_in_settings, line_in_volume_range),
+        ] {
+            settings.lock(|x| {
+                x.set(AudioSettings {
+                    muted: [false; MAX_AUDIO_CHANNEL_COUNT],
+                    volume_8q8_db: [range.initial_8q8(); MAX_AUDIO_CHANNEL_COUNT],
+                })
+            });
+        }
         shared.sample_rates_hz = sample_rates_hz;
         shared.sample_rate_hz.store(sample_rates_hz[0], Ordering::Relaxed);
 
@@ -386,6 +463,11 @@ impl<'d, D: Driver<'d>> IoBox<'d, D> {
             line_out: LineOutStream { ep: out_ep },
             line_in: LineInStream { ep: in_ep },
             feedback: Feedback { ep: feedback_ep },
+            interrupt: interrupt_ep.map(|ep| Interrupt {
+                ep,
+                shared: &state.shared,
+                interface: control_interface.into(),
+            }),
             control_monitor: ControlMonitor { shared: &state.shared },
         }
     }
@@ -558,6 +640,58 @@ impl<'d, D: Driver<'d>> Feedback<'d, D> {
     }
 }
 
+/// The AudioControl interrupt endpoint: tells the host which controls the device changed
+/// itself, so it reads them again. Keep [`Self::run`] running.
+pub struct Interrupt<'d, D: Driver<'d>> {
+    ep: D::EndpointIn,
+    shared: &'d SharedControl<'d>,
+    interface: u8,
+}
+
+impl<'d, D: Driver<'d>> Interrupt<'d, D> {
+    /// Sends a notification for each control changed through
+    /// [`ControlMonitor::set_line_out_volume`] or [`ControlMonitor::set_line_in_volume`].
+    pub async fn run(&mut self) -> ! {
+        loop {
+            self.ep.wait_enabled().await;
+            loop {
+                let p = self.shared.pending.lock(|x| x.replace(Pending::default()));
+                if p.line_out | p.line_in == 0 {
+                    self.shared.pending_signal.wait().await;
+                    continue;
+                }
+                if self.notify(OUT_FEATURE_UNIT_ID, p.line_out).await.is_err()
+                    || self.notify(IN_FEATURE_UNIT_ID, p.line_in).await.is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn notify(&mut self, entity: u8, bits: u32) -> Result<(), EndpointError> {
+        for bit in (0..2 * MAX_AUDIO_CHANNEL_COUNT as u32).filter(|b| bits & 1 << b != 0) {
+            let control = if bit % 2 == 0 {
+                control_selector::feature_unit::MUTE_CONTROL
+            } else {
+                control_selector::feature_unit::VOLUME_CONTROL
+            };
+            let channel = (bit / 2) as u8;
+            // bInfo: class-specific, interface; bAttribute: CUR; wValue: CS, CN; wIndex: entity, interface
+            let msg = [
+                0x00,
+                request_code::CUR,
+                channel,
+                (control >> 8) as u8,
+                self.interface,
+                entity,
+            ];
+            self.ep.write(&msg).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Audio settings for a feature unit: mute and volume per channel, the master first.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -570,9 +704,17 @@ impl Default for AudioSettings {
     fn default() -> Self {
         AudioSettings {
             muted: [false; MAX_AUDIO_CHANNEL_COUNT],
-            volume_8q8_db: [MAX_VOLUME_DB * VOLUME_STEPS_PER_DB; MAX_AUDIO_CHANNEL_COUNT],
+            volume_8q8_db: [0; MAX_AUDIO_CHANNEL_COUNT],
         }
     }
+}
+
+/// Controls with changes for the host to read, per Feature Unit: bit `2 * channel` for mute,
+/// `2 * channel + 1` for volume.
+#[derive(Clone, Copy, Default)]
+struct Pending {
+    line_out: u32,
+    line_in: u32,
 }
 
 struct SharedControl<'d> {
@@ -582,6 +724,10 @@ struct SharedControl<'d> {
     line_in_channels: &'d [Channel],
     line_out_controls: Vec<FeatureUnitControls, MAX_AUDIO_CHANNEL_COUNT, u8>,
     line_in_controls: Vec<FeatureUnitControls, MAX_AUDIO_CHANNEL_COUNT, u8>,
+    line_out_volume_range: VolumeRange,
+    line_in_volume_range: VolumeRange,
+    pending: CriticalSectionMutex<Cell<Pending>>,
+    pending_signal: Signal<CriticalSectionRawMutex, ()>,
     sample_rates_hz: &'d [u32],
     sample_rate_hz: AtomicU32,
     clock_valid: AtomicBool,
@@ -597,6 +743,10 @@ impl<'d> Default for SharedControl<'d> {
             line_in_channels: &[],
             line_out_controls: Vec::new(),
             line_in_controls: Vec::new(),
+            line_out_volume_range: VolumeRange::DEFAULT,
+            line_in_volume_range: VolumeRange::DEFAULT,
+            pending: CriticalSectionMutex::new(Cell::new(Pending::default())),
+            pending_signal: Signal::new(),
             sample_rates_hz: &[],
             sample_rate_hz: AtomicU32::new(0),
             clock_valid: AtomicBool::new(true),
@@ -608,6 +758,7 @@ impl<'d> Default for SharedControl<'d> {
 struct FeatureUnitRef<'a> {
     settings: &'a CriticalSectionMutex<Cell<AudioSettings>>,
     controls: &'a [FeatureUnitControls],
+    range: VolumeRange,
 }
 
 impl FeatureUnitRef<'_> {
@@ -677,6 +828,97 @@ impl<'d> ControlMonitor<'d> {
         self.shared.clock_valid.store(valid, Ordering::Relaxed);
     }
 
+    /// Set a line out channel's own volume (not the master's) from the device side, for
+    /// example from a front panel. The host is told through the interrupt endpoint, if there is
+    /// one; [`Self::changed`] doesn't fire. Without a mute control, [`Volume::Muted`] sets the
+    /// volume to silence. Out-of-range volumes are clamped to the advertised range.
+    pub fn set_line_out_volume(&self, channel: Channel, volume: Volume) {
+        let s = self.shared;
+        let bits = Self::set_volume(
+            &s.line_out_settings,
+            s.line_out_channels,
+            &s.line_out_controls,
+            s.line_out_volume_range,
+            channel,
+            volume,
+        );
+        self.add_pending(bits, 0);
+    }
+
+    /// Set a line in channel's own volume from the device side, as [`Self::set_line_out_volume`].
+    pub fn set_line_in_volume(&self, channel: Channel, volume: Volume) {
+        let s = self.shared;
+        let bits = Self::set_volume(
+            &s.line_in_settings,
+            s.line_in_channels,
+            &s.line_in_controls,
+            s.line_in_volume_range,
+            channel,
+            volume,
+        );
+        self.add_pending(0, bits);
+    }
+
+    /// Returns the pending bits of the controls that changed.
+    fn set_volume(
+        settings: &CriticalSectionMutex<Cell<AudioSettings>>,
+        channels: &[Channel],
+        controls: &[FeatureUnitControls],
+        range: VolumeRange,
+        channel: Channel,
+        volume: Volume,
+    ) -> u32 {
+        let Some(index) = channels.iter().position(|&c| c == channel).map(|i| i + 1) else {
+            return 0;
+        };
+        let c = controls.get(index).copied().unwrap_or_else(FeatureUnitControls::empty);
+        let (mute_bit, volume_bit) = (1u32 << (2 * index), 1u32 << (2 * index + 1));
+        settings.lock(|x| {
+            let mut s = x.get();
+            let mut set_muted = |muted: bool| {
+                let changed = c.contains(FeatureUnitControls::MUTE) && s.muted[index] != muted;
+                if changed {
+                    s.muted[index] = muted;
+                }
+                if changed { mute_bit } else { 0 }
+            };
+            let bits = match volume {
+                Volume::Muted if c.contains(FeatureUnitControls::MUTE) => set_muted(true),
+                Volume::Muted => set_muted(false) | Self::set_8q8(&mut s, c, index, VOLUME_SILENCE_8Q8_DB, volume_bit),
+                Volume::DeciBel(db) => {
+                    let db = db.clamp(range.min_db as f32, range.max_db as f32);
+                    // round half away from zero (no `f32::round` in core)
+                    let steps = db * VOLUME_STEPS_PER_DB as f32;
+                    let v = (steps + if steps < 0.0 { -0.5 } else { 0.5 }) as i16;
+                    set_muted(false) | Self::set_8q8(&mut s, c, index, v, volume_bit)
+                }
+            };
+            x.set(s);
+            bits
+        })
+    }
+
+    fn set_8q8(s: &mut AudioSettings, c: FeatureUnitControls, index: usize, v: i16, bit: u32) -> u32 {
+        if !c.contains(FeatureUnitControls::VOLUME) || s.volume_8q8_db[index] == v {
+            return 0;
+        }
+        s.volume_8q8_db[index] = v;
+        bit
+    }
+
+    fn add_pending(&self, line_out: u32, line_in: u32) {
+        if line_out | line_in == 0 {
+            return;
+        }
+        self.shared.pending.lock(|x| {
+            let mut p = x.get();
+            p.line_out |= line_out;
+            p.line_in |= line_in;
+            x.set(p);
+        });
+        self.shared.pending_signal.signal(());
+    }
+
     /// Wait for the sample rate, a volume or a mute state to change. Single consumer: await this
     /// from at most one task.
     pub async fn changed(&self) {
@@ -696,10 +938,12 @@ impl<'d> Control<'d> {
             OUT_FEATURE_UNIT_ID if !s.line_out_controls.is_empty() => Some(FeatureUnitRef {
                 settings: &s.line_out_settings,
                 controls: &s.line_out_controls,
+                range: s.line_out_volume_range,
             }),
             IN_FEATURE_UNIT_ID if !s.line_in_controls.is_empty() => Some(FeatureUnitRef {
                 settings: &s.line_in_settings,
                 controls: &s.line_in_controls,
+                range: s.line_in_volume_range,
             }),
             _ => None,
         }
@@ -758,10 +1002,7 @@ impl<'d> Control<'d> {
                     } else {
                         let volume = i16::from_le_bytes([data[0], data[1]]);
                         // CUR lies within the advertised range, except silence, which is always accepted.
-                        if volume != VOLUME_SILENCE_8Q8_DB
-                            && !(MIN_VOLUME_DB * VOLUME_STEPS_PER_DB..=MAX_VOLUME_DB * VOLUME_STEPS_PER_DB)
-                                .contains(&volume)
-                        {
+                        if volume != VOLUME_SILENCE_8Q8_DB && !fu.range.contains_8q8(volume) {
                             return false;
                         }
                         s.volume_8q8_db[channel as usize] = volume;
@@ -844,9 +1085,10 @@ impl<'d> Control<'d> {
                         if controls.contains(FeatureUnitControls::VOLUME) && buf.len() >= 8 =>
                     {
                         buf[..2].copy_from_slice(&1u16.to_le_bytes());
-                        buf[2..4].copy_from_slice(&(MIN_VOLUME_DB * VOLUME_STEPS_PER_DB).to_le_bytes());
-                        buf[4..6].copy_from_slice(&(MAX_VOLUME_DB * VOLUME_STEPS_PER_DB).to_le_bytes());
-                        buf[6..8].copy_from_slice(&VOLUME_STEPS_PER_DB.to_le_bytes());
+                        let r = fu.range;
+                        buf[2..4].copy_from_slice(&(r.min_db as i16 * VOLUME_STEPS_PER_DB).to_le_bytes());
+                        buf[4..6].copy_from_slice(&(r.max_db as i16 * VOLUME_STEPS_PER_DB).to_le_bytes());
+                        buf[6..8].copy_from_slice(&(r.res_db as i16 * VOLUME_STEPS_PER_DB).to_le_bytes());
                         Some(InResponse::Accepted(&buf[..8]))
                     }
                     _ => Some(InResponse::Rejected),
@@ -858,9 +1100,9 @@ impl<'d> Control<'d> {
 
 impl<'d> Handler for Control<'d> {
     fn reset(&mut self) {
+        // Volume and mute stay as they are: the device may keep them itself (a front panel,
+        // settings in flash), and the host reads them back after enumeration.
         let s = self.shared;
-        s.line_out_settings.lock(|x| x.set(AudioSettings::default()));
-        s.line_in_settings.lock(|x| x.set(AudioSettings::default()));
         if let Some(&rate) = s.sample_rates_hz.first() {
             s.sample_rate_hz.store(rate, Ordering::Relaxed);
         }
