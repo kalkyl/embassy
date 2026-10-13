@@ -121,8 +121,8 @@ fn selector(req: &Request) -> u16 {
 /// I/O box stream settings and optional host controls.
 #[derive(Clone)]
 pub struct Config<'d> {
-    /// Supported sample rates in Hz, shared by both directions: one to ten discrete values.
-    /// The first is reported before the host selects a rate.
+    /// Supported sample rates in Hz, shared by both directions: one to ten discrete values, in
+    /// any order. The first is reported before the host selects a rate.
     pub sample_rates_hz: &'d [u32],
     /// The audio sample resolution of both streams.
     pub sample_width: SampleWidth,
@@ -1046,7 +1046,12 @@ impl<'d> Control<'d> {
                     return Some(InResponse::Rejected);
                 }
                 buf[..2].copy_from_slice(&(rates.len() as u16).to_le_bytes());
-                for (i, &rate) in rates.iter().enumerate() {
+                // Sub-ranges in ascending order, whatever the configured order.
+                let mut sorted = [0u32; MAX_SAMPLE_RATE_COUNT];
+                let sorted = &mut sorted[..rates.len()];
+                sorted.copy_from_slice(rates);
+                sorted.sort_unstable();
+                for (i, &rate) in sorted.iter().enumerate() {
                     let sub = &mut buf[2 + 12 * i..2 + 12 * (i + 1)];
                     sub[..4].copy_from_slice(&rate.to_le_bytes()); // dMIN
                     sub[4..8].copy_from_slice(&rate.to_le_bytes()); // dMAX
